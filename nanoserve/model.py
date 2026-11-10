@@ -93,6 +93,13 @@ class LayerWeights:
         return cls(**{field: sd[f"model.layers.{i}.{hf}"] for field, hf in cls.HF_NAMES.items()})
 
 
+@dataclass
+class SeqInput:
+    """One sequence's slice of a batched step: how many of the flattened tokens are its, and its cache."""
+    n_tokens: int
+    cache: object | None = None   # a KV cache with .length / .write(layer, k, v) / .advance(T), or None
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Scale x so its root-mean-square is 1, then multiply by a learned per-channel weight.
     Computed in fp32 (bf16 squares overflow/round badly), cast back before the weight multiply -- as HF."""
@@ -151,45 +158,75 @@ class Qwen2Model:
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos().to(self.dtype), emb.sin().to(self.dtype)
 
-    def _attention(self, i: int, layer: LayerWeights, h: torch.Tensor, cos, sin, cache) -> torch.Tensor:
-        B, T, _ = h.shape
+    def _attention(self, i: int, layer: LayerWeights, h: torch.Tensor, cos, sin,
+                   seqs: list[SeqInput]) -> torch.Tensor:
+        """h: [1, N, hidden] = the flattened tokens of every sequence in this step.
+
+        SELECTIVE BATCHING: the Q/K/V/O projections and RoPE are token-wise, so they run ONCE over all N
+        tokens. Attention mixes tokens *within* a sequence, against that sequence's own cache, so it runs
+        once PER SEQUENCE. (M4 replaces this Python loop with one kernel covering every sequence.)
+        """
+        N = h.shape[1]
         hd = self.cfg.head_dim
-        q = F.linear(h, layer.q_w, layer.q_b).view(B, T, -1, hd).transpose(1, 2)   # [B, n_heads, T, hd]
-        k = F.linear(h, layer.k_w, layer.k_b).view(B, T, -1, hd).transpose(1, 2)   # [B, n_kv_heads, T, hd]
-        v = F.linear(h, layer.v_w, layer.v_b).view(B, T, -1, hd).transpose(1, 2)
-        c, s = cos.unsqueeze(1), sin.unsqueeze(1)                                   # broadcast over heads
+        q = F.linear(h, layer.q_w, layer.q_b).view(1, N, -1, hd)   # [1, N, n_heads, hd]
+        k = F.linear(h, layer.k_w, layer.k_b).view(1, N, -1, hd)   # [1, N, n_kv_heads, hd]
+        v = F.linear(h, layer.v_w, layer.v_b).view(1, N, -1, hd)
+        c, s = cos.unsqueeze(2), sin.unsqueeze(2)                   # [1, N, 1, hd]: broadcast over heads
         q = q * c + rotate_half(q) * s
         k = k * c + rotate_half(k) * s
-        if cache is not None:
-            # Store this step's K/V, get back K/V for ALL tokens so far (cached + new).
-            k, v = cache.write(i, k, v)
-        # is_causal only for multi-token steps: during prefill token t must not see tokens > t.
-        # A single decode token may see everything in the cache, so no mask is needed.
-        # NOTE: SDPA's is_causal assumes queries and keys start at the same position, so a multi-token
-        # step on top of a non-empty cache (chunked prefill) would be WRONG here. Engine forbids it (M1).
-        o = F.scaled_dot_product_attention(q, k, v, is_causal=T > 1, scale=hd ** -0.5, enable_gqa=True)
-        o = o.transpose(1, 2).contiguous().reshape(B, T, -1).contiguous()
+        outs, start = [], 0
+        for seq in seqs:
+            T = seq.n_tokens
+            qs = q[:, start:start + T].transpose(1, 2)              # [1, n_heads, T, hd]
+            ks = k[:, start:start + T].transpose(1, 2)
+            vs = v[:, start:start + T].transpose(1, 2)
+            if seq.cache is not None:
+                # Store this step's K/V, get back K/V for ALL tokens so far (cached + new).
+                ks, vs = seq.cache.write(i, ks, vs)
+            # is_causal only for multi-token steps (prefill): token t must not see tokens > t.
+            # A single decode token may see its whole cache, so no mask is needed.
+            # NOTE: SDPA's is_causal assumes queries and keys start at the same position, so a multi-token
+            # step on top of a non-empty cache (chunked prefill) would be WRONG. forward_batch forbids it.
+            o = F.scaled_dot_product_attention(qs, ks, vs, is_causal=T > 1, scale=hd ** -0.5, enable_gqa=True)
+            outs.append(o.transpose(1, 2).contiguous().reshape(1, T, -1).contiguous())
+            start += T
+        o = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
         return F.linear(o, layer.o_w)
 
     @torch.inference_mode()
-    def forward(self, token_ids: torch.Tensor, positions: torch.Tensor, cache=None,
-                logits: str = "last") -> torch.Tensor:
-        """token_ids, positions: [T] for ONE sequence. Returns logits [T, vocab] ("all") or [1, vocab] ("last").
+    def forward_batch(self, token_ids: torch.Tensor, positions: torch.Tensor, seqs: list[SeqInput],
+                      logits: str = "last") -> torch.Tensor:
+        """One forward pass over several sequences, each either PREFILLING (many tokens, empty cache) or
+        DECODING (one token on top of its cache).
 
-        With a cache, K/V for these T tokens are appended to it and attention covers all cached tokens.
+        token_ids, positions: [N] = all sequences' tokens concatenated, in the order of `seqs`.
+        Returns logits [len(seqs), vocab] for each sequence's LAST token ("last"), or [N, vocab] ("all").
         """
-        if cache is not None and token_ids.shape[0] > 1 and cache.length > 0:
-            raise NotImplementedError("multi-token step on a non-empty cache (chunked prefill) is not supported")
-        x = F.embedding(token_ids, self.embed)[None]          # [1, T, hidden]
+        for seq in seqs:
+            if seq.cache is not None and seq.n_tokens > 1 and seq.cache.length > 0:
+                raise NotImplementedError("multi-token step on a non-empty cache (chunked prefill) is not supported")
+        assert sum(s.n_tokens for s in seqs) == token_ids.shape[0], "seqs must cover token_ids exactly"
+        x = F.embedding(token_ids, self.embed)[None]          # [1, N, hidden]
         cos, sin = self.rope(positions)
         eps = self.cfg.rms_norm_eps
         for i, layer in enumerate(self.layers):
-            x = x + self._attention(i, layer, rms_norm(x, layer.ln1, eps), cos, sin, cache)
+            x = x + self._attention(i, layer, rms_norm(x, layer.ln1, eps), cos, sin, seqs)
             h = rms_norm(x, layer.ln2, eps)
             x = x + F.linear(F.silu(F.linear(h, layer.gate_w)) * F.linear(h, layer.up_w), layer.down_w)
-        if cache is not None:
-            cache.advance(token_ids.shape[0])
+        for seq in seqs:
+            if seq.cache is not None:
+                seq.cache.advance(seq.n_tokens)
         x = rms_norm(x, self.norm, eps)
         if logits == "last":
-            x = x[:, -1:, :]    # only score the next token: a [1, hidden] x [hidden, vocab] matmul, not [T, ...]
+            # Only score each sequence's next token: a [B, hidden] x [hidden, vocab] matmul, not [N, ...].
+            if len(seqs) == 1:
+                x = x[:, -1:, :]
+            else:
+                ends = torch.tensor([s.n_tokens for s in seqs], device=x.device).cumsum(0) - 1
+                x = x[:, ends, :]
         return F.linear(x, self.lm_head)[0]
+
+    def forward(self, token_ids: torch.Tensor, positions: torch.Tensor, cache=None,
+                logits: str = "last") -> torch.Tensor:
+        """ONE sequence (the M1 API): forward_batch with a single SeqInput."""
+        return self.forward_batch(token_ids, positions, [SeqInput(token_ids.shape[0], cache)], logits=logits)
