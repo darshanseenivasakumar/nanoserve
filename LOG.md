@@ -104,3 +104,64 @@ What failed: nothing in M1 itself. (Fixed beforehand: repetition_penalty comment
   power plan "Balanced". Our decode is CPU/launch-bound, so it tracks CPU availability directly.
   GPU was at full clock (2025 MHz, P0), so not the GPU.
 - Action: methodology now requires a same-session control (CLAUDE.md). M2 numbers wait for a quiet machine.
+
+## 2026-11-10/11 — M2: static vs continuous batching (selective batching, contiguous KV)
+Correctness (before measuring): fp32 batched == alone token-for-token (12 staggered requests, both
+policies); bf16 10/12 identical, 2 diverge at near-ties (gaps 0.062, 0.250; approved rule <= 0.25).
+Tests: 78 passed.
+
+Control: background apps closed; M1 code vs M2 code A/B at batch 1: 29.5-35 ms vs 29.8-33 ms TPOT
+(equal). Machine still ~20% slower than during M0/M1, so HF and vLLM were RE-MEASURED in this session.
+All rows below: same session, 64 prompts, warmup 4, median of 3, all sanity checks OK.
+Script: bench/runs/m2_bench.sh (sync check: bench/runs/m2_sync_policy_check.py; capacity: bench/runs/m2_max_contiguous_caches.py) (commands below). Summaries: `python -m bench.summarize "*m2session*" "*nanoserve-m2*" "*var16-256*"`.
+
+Workload A: fixed 128 output tokens
+| engine | c=1 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|---|
+| HF generate (static, padded)  tok/s | 29.9 | 98.8 | 183.7 | - | - |
+| nanoserve M2 static           tok/s | (=cont.) | 99.5 | 151.0 | 184.2 | 221.3 |
+| nanoserve M2 continuous       tok/s | 35.4 | 104.2 | 135.4 (108-140) | 161.4 | 246.4 |
+| vLLM 0.33.0                   tok/s | 121.9 | 437.6 | 803.8 | 1422.2 | 2212.6 |
+| TPOT p50 ms: HF / static / cont / vLLM | 33.3 / - / 28.1 / 8.0 | 39.4 / 38.8 / 38.0 / 8.7 | 40.7 / 49.8 / 57.5 / 8.9 | - / 83.0 / 98.1 / 9.5 | - / 126.3 / 126.5 / 11.6 |
+| TTFT p50 ms: HF / static / cont / vLLM | 39 / - / 30 / 29 | 191 / 78 / 91 / 48 | 384 / 156 / 191 / 127 | - / 318 / 325 / 195 | - / 575 / 571 / 336 |
+
+Workload B: varied output length, uniform 16-256 per request (seeded), `--output-len-range 16,256`
+| engine | c=4 tok/s | c=8 tok/s | c=16 tok/s | TTFT p50/p99 ms @c=8 | TTFT p50/p99 ms @c=16 |
+|---|---|---|---|---|---|
+| nanoserve M2 static     | 61.4 | 103.8 | 146.0 | 3,364 / 10,489 | 3,415 / 14,298 |
+| nanoserve M2 continuous | 91.5 | 131.8 | 185.6 | 114 / 157      | 161 / 268 |
+| vLLM 0.33.0             | 439.7 | 765.4 | 1289.3 | 46 / 136      | 59 / 233 |
+(HF not run on B: its backend needs equal lengths per static batch; our static policy shows the effect.)
+
+Results files: bench/results/20261110-165115_* (HF), -171202_* (cont), -173557_* (static),
+*_var16-256.json (B), 20261110-18*_vllm_* (vLLM). Same-session M0 comparisons: HF c=1 34.0 -> 29.9,
+vLLM c=8 801.2 -> 803.8 (vLLM barely moved: CUDA graphs make it far less CPU-sensitive).
+
+Findings:
+1. Continuous batching wins where it should, on VARIED lengths: +49% / +27% / +27% throughput at
+   c=4/8/16, and TTFT p50 ~30x lower (3.4 s -> 114 ms at c=8; p99 10.5 s -> 157 ms). Static batches wait
+   for their longest member while finished seats sit idle, and new arrivals wait for the whole batch.
+2. On FIXED lengths the policies are equal (as predicted): all requests in a batch finish together.
+   The harness showed static > continuous at c=8 (151 vs 135, continuous spread 108-140), but a
+   synchronous single-thread closed loop (no asyncio) gives static 142-146 vs continuous 147 tok/s with
+   identical ~53 ms steps. => the gap is the async layer + noise, not the policy. Suspect GIL contention
+   (harness thread tokenizes/submits while the engine thread launches kernels) -- NOT proven.
+3. Each extra sequence costs ~4-5 ms per step (TPOT 28 ms @1 -> 57 @8 -> 98 @16 -> 126 @32): the
+   per-sequence attention loop (SDPA + 2 cache writes + slicing per sequence per layer). This is why we
+   LOSE to HF's padded static batch at c=8 on fixed lengths (151 vs 184 tok/s): HF runs ONE attention call
+   per layer for the whole batch. vLLM's TPOT barely grows (8.0 -> 11.6 ms at c=32).
+4. vs vLLM: 17% of its throughput at c=8 (fixed), 11% at c=32; 17% at c=8 on varied lengths.
+5. Memory: contiguous reservation = 24 MiB/request (2048 x 12,288 B). VRAM after model load 4.06 GiB
+   -> at most 173 requests (upper bound; activations need room too).
+   SURPRISE: allocating reservations until OOM got 642 (15 GiB) -- the Windows NVIDIA driver's
+   "sysmem fallback" spills CUDA allocations into shared system RAM (~12 GB) instead of failing.
+   On this laptop "max concurrency before OOM" is therefore not a clean metric: M3 must admit by an
+   explicit VRAM budget (like vLLM's --gpu-memory-utilization). The Linux cloud GPU will OOM normally.
+
+What failed / changed along the way:
+- Test criterion changed (rule 6): bf16 batched-vs-alone logits check (torch default bf16 tolerance)
+  replaced by "no added error vs fp32 (<= 1.5x alone's) + same argmax unless top-2 gap <= 0.25" --
+  bf16 alone already fails the default tolerance vs fp32 (0.26-0.41 max |diff|). fp32 gate unchanged.
+- Test changed (rule 6): M1's "requests are serialized" test replaced by "requests overlap" (M2 intent).
+- My benchmark-log grep missed nanoserve rows (engine name has a hyphen); all results were saved,
+  read back with the new bench/summarize.py.

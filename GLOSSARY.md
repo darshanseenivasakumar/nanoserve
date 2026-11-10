@@ -116,6 +116,31 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
   trust its GPU-side numbers more than its wall time.
 - **Serialization / queueing delay**: when requests must wait their turn. Shows up as TTFT, not TPOT.
 
+## Batching and scheduling (M2)
+- **Scheduler**: the part of the engine that decides, every step, which requests run.
+- **Static batching**: a batch runs until ALL its requests finish; new requests wait for the next batch.
+  Like a tour bus that only leaves full and only takes new passengers when everyone is back.
+- **Continuous batching / iteration-level scheduling** (Orca, OSDI 2022; vLLM): the batch is re-decided
+  every step; finished requests leave immediately and waiting ones join at the next step. A city bus.
+- **Selective batching**: run the token-wise layers (projections, MLP, norms) once over the flattened
+  tokens of all requests, but run attention separately per request (each has its own history).
+- **Mixed step**: one forward pass containing both prefills (new requests) and decodes (running ones).
+- **Token budget (max_num_batched_tokens)**: cap on tokens processed per step; a prefill costs its whole
+  prompt, a decode costs 1. Bounds how long a single step can take.
+- **Head-of-line blocking / FCFS**: first-come-first-served; if the request at the front can't fit, nobody
+  behind it may jump ahead. Simple and starvation-free, sometimes less efficient.
+- **Batch invariance**: whether a request's output is identical no matter what else is in its batch.
+  Not guaranteed in bf16: matmul libraries pick different algorithms for different batch shapes, which
+  changes rounding.
+- **Workload / output-length distribution**: how long requests' outputs are. Fixed lengths hide static
+  batching's waste; varied lengths (realistic) expose it.
+- **GIL (global interpreter lock)**: only one Python thread runs Python code at a time. Two busy Python
+  threads (our engine and the harness) slow each other down.
+- **Sysmem fallback (Windows NVIDIA driver)**: when VRAM is full, CUDA allocations silently spill into
+  system RAM instead of failing -- the program keeps running, much slower. Hides OOM on this laptop.
+- **Control measurement**: re-measuring a known reference in the same session so a comparison isn't
+  polluted by the machine changing (background load, heat, power mode).
+
 ## Tooling
 - **uv**: a fast Python package/project manager. `uv sync` installs exactly what `pyproject.toml`/`uv.lock` say.
 - **venv (virtual environment)**: an isolated folder of Python packages. vLLM gets its own because it pins a
