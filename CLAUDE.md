@@ -48,6 +48,7 @@ uv run pytest -v                          # all tests (gpu tests included)
 uv run pytest -v -m "not gpu"             # fast tests only
 uv run python -m bench.harness --backend hf --concurrency 1,4,8
 uv run python -m bench.harness --backend openai --base-url http://localhost:8000 --engine-name vllm ...
+bash bench/servers/build_llamacpp.sh      # build llama-server (pinned tag, CUDA) + fetch f16 GGUF
 bash bench/servers/vllm.sh                # start vLLM server (own venv)
 bash bench/servers/llamacpp.sh            # start llama-server
 ```

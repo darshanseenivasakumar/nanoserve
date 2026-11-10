@@ -16,6 +16,9 @@ MODEL="${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}"
 PORT="${PORT:-8000}"
 GPU_UTIL="${GPU_UTIL:-0.7}"
 VENV="${VLLM_VENV:-$HOME/envs/vllm}"
+# FlashInfer (vLLM's attention kernels) JIT-compiles CUDA code on first start: it needs `ninja`
+# (lives in the venv's bin/) and `nvcc` (CUDA toolkit). We don't activate the venv, so put both on PATH.
+export PATH="$VENV/bin:/usr/local/cuda/bin:$PATH"
 
 exec "$VENV/bin/vllm" serve "$MODEL" \
   --port "$PORT" \

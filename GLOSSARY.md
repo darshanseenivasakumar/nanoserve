@@ -39,6 +39,9 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
 - **E2E latency (end-to-end)**: time from sending a request to receiving its last token.
 - **Percentile, p50 / p99**: sort all values; p50 (median) is the middle one, p99 is the value 99% of requests
   beat. p99 shows the unlucky "tail". With few samples p99 is basically the maximum, so always report n.
+- **Percentile by linear interpolation**: how we compute p50/p99 (same as `numpy.percentile` and vLLM's
+  benchmark scripts). If p99 falls "between" two sorted samples, blend them by distance. The alternative,
+  *nearest-rank*, always returns a real observed value. They differ noticeably only on small samples.
 - **Tail latency**: the slow end of the latency distribution (p99, p99.9). Users notice tails.
 - **Concurrency (closed-loop)**: N simulated users, each sending a new request as soon as its previous one
   finishes, so N requests are always in flight.
@@ -66,6 +69,23 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
 - **GGUF**: llama.cpp's single-file model format (weights + tokenizer + metadata). Comes in many precisions;
   we use f16 for fair comparison with bf16 engines.
 - **Quantization**: storing weights in fewer bits (8, 4…) to save memory and bandwidth at some accuracy cost.
+
+## Performance concepts (seen in M0 results)
+- **Kernel launch overhead**: every GPU operation is started by the CPU, costing a few microseconds.
+  A transformer step launches hundreds of small kernels; for a small model the GPU finishes each one
+  faster than Python can launch the next, so the GPU sits idle. Like a chef who cooks in 1 second but
+  waits 5 seconds for each order slip.
+- **CUDA graph**: record a whole sequence of GPU launches once, then replay it with a single launch.
+  Removes most launch overhead. vLLM captures graphs at startup (the "Capturing CUDA graphs" lines).
+- **Memory-bandwidth bound**: speed is limited by how fast weights can be read from VRAM, not by
+  arithmetic. Decode is like this: each step reads all weights to produce one token per request. Batching
+  helps because one read of the weights serves every request in the batch.
+- **Compute bound**: limited by arithmetic throughput. Prefill of long prompts tends toward this.
+- **JIT (just-in-time) compilation**: compiling code the first time it runs, for the exact GPU present.
+  Triton and FlashInfer both do this (that's why vLLM needed `ninja` and `nvcc`).
+- **FlashInfer**: a library of fast attention kernels that vLLM uses.
+- **Slot (llama.cpp)**: one of N fixed request lanes in llama-server (`-np N`). Each slot gets an equal
+  share of the context (`-c / -np`). Requests beyond N wait.
 
 ## Tooling
 - **uv**: a fast Python package/project manager. `uv sync` installs exactly what `pyproject.toml`/`uv.lock` say.
