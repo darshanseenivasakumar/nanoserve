@@ -34,6 +34,9 @@ simple analogies, and add it to GLOSSARY.md.
   always use `wsl -d Ubuntu`). User `darshan`, repo at `~/nanoserve`.
 - GPU: RTX 3050 6GB Laptop (Ampere, sm_86, bf16 OK). ~0.6–0.9 GB VRAM is used by the display.
 - WSL RAM cap is ~11 GB (WSL default). Raise with `memory=` in `C:\Users\Lenovo\.wslconfig` if needed.
+- Windows NVIDIA "sysmem fallback": CUDA allocations past VRAM silently spill into shared system RAM
+  (~12 GB) instead of raising OOM, then run slowly. Never use "allocate until OOM" as a capacity metric
+  here; admit by an explicit VRAM budget. (The Linux cloud GPU OOMs normally.)
 - The Ubuntu virtual disk lives at `D:\WSL\Ubuntu\ext4.vhdx` (moved off C: on 2026-11-10 after C: filled
   up and WSL hit I/O errors). Watch free space on D: before big downloads (models, engines).
 - Python 3.11 via uv; torch from the PyTorch cu130 index (see pyproject.toml). Triton ships with torch.
