@@ -101,6 +101,9 @@ def make_backend(args) -> Backend:
     if args.backend == "hf":
         from bench.backends.hf import HFBackend
         return HFBackend(args.model, device=args.device, dtype=args.dtype)
+    if args.backend == "nanoserve":
+        from bench.backends.nanoserve_inproc import NanoserveBackend
+        return NanoserveBackend(args.model, device=args.device, dtype=args.dtype, max_seq_len=args.max_seq_len)
     from bench.backends.openai_http import OpenAIBackend
     return OpenAIBackend(args.base_url, model=args.served_model_name or args.model, engine_name=args.engine_name)
 
@@ -174,11 +177,12 @@ async def amain(args) -> int:
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="nanoserve benchmark harness")
-    p.add_argument("--backend", choices=["hf", "openai"], required=True)
+    p.add_argument("--backend", choices=["hf", "openai", "nanoserve"], required=True)
     p.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     p.add_argument("--tokenizer", default=None, help="defaults to --model")
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    p.add_argument("--max-seq-len", type=int, default=2048, help="nanoserve: per-request KV reservation")
     p.add_argument("--base-url", default="http://localhost:8000")
     p.add_argument("--engine-name", default="openai", help="vllm | llamacpp | nanoserve (selects per-engine fairness flags)")
     p.add_argument("--served-model-name", default=None)

@@ -87,6 +87,35 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
 - **Slot (llama.cpp)**: one of N fixed request lanes in llama-server (`-np N`). Each slot gets an equal
   share of the context (`-c / -np`). Requests beyond N wait.
 
+## Engine internals (M1)
+- **Q, K, V (query, key, value)**: three vectors each token makes in every attention layer. A token's Q
+  asks "what am I looking for?", every earlier token's K answers "what do I contain?", and the matching
+  tokens' Vs are blended into the result.
+- **RoPE (rotary position embedding)**: encodes a token's position by rotating its Q and K vectors by an
+  angle proportional to the position, like clock hands. K is stored already-rotated, so cached K never changes.
+- **GQA (grouped-query attention)**: several query heads share one K/V head (Qwen2.5-0.5B: 14 query heads,
+  2 K/V heads). Makes the KV cache 7x smaller with little quality loss.
+- **RMSNorm**: rescales a vector so its root-mean-square is 1, then multiplies by learned weights. Keeps
+  numbers in a stable range between layers.
+- **SwiGLU MLP**: the per-token feed-forward block: `down(silu(gate(x)) * up(x))`.
+- **Logits**: the raw score the model gives every vocabulary token for "what comes next". Greedy = argmax.
+- **Tied embeddings**: the output layer reuses the input embedding table instead of having its own.
+- **KV bytes per token**: layers x 2 (K and V) x kv_heads x head_dim x bytes per number. 12 KB for
+  Qwen2.5-0.5B in bf16, 36 KB for Qwen2.5-3B.
+- **Contiguous KV cache**: one pre-reserved block per request sized for the maximum length. Simple, but
+  short requests waste most of their reservation.
+- **Internal fragmentation**: memory reserved by someone but not used by them, so no one else can use it
+  either. The contiguous cache's main flaw; the paged cache (M3) fixes it.
+- **Chunked prefill**: processing a long prompt in pieces on top of an already-filled cache. Not supported
+  in M1 (needs a causal mask offset by the cached length).
+- **Bitwise equal**: two results identical down to the last bit, not just "close". Achieved in M1 by
+  performing floating-point operations in exactly HF's order.
+- **Roofline (bound)**: the best speed physics allows: here, weight bytes / memory bandwidth for decode.
+  Lets you say how far from optimal a measurement is.
+- **Profiler**: a tool that records what ran and for how long (torch.profiler). It slows the CPU side, so
+  trust its GPU-side numbers more than its wall time.
+- **Serialization / queueing delay**: when requests must wait their turn. Shows up as TTFT, not TPOT.
+
 ## Tooling
 - **uv**: a fast Python package/project manager. `uv sync` installs exactly what `pyproject.toml`/`uv.lock` say.
 - **venv (virtual environment)**: an isolated folder of Python packages. vLLM gets its own because it pins a

@@ -59,3 +59,38 @@ Failed along the way:
 
 Caveats: laptop GPU, display shares the GPU; llama.cpp is f16 vs bf16 for the others; vLLM/llama.cpp
 rows are smoke-level comparisons (full comparison is M6, on the cloud GPU too).
+
+## 2026-11-10 — M1: naive engine (own forward, contiguous KV cache, greedy, batch size 1)
+Correctness (all before any measurement):
+- Forward pass vs HF: fp32 (CPU) max |diff| < 1e-3; **bf16 (GPU) bitwise equal** on 4 prompts (43-612 tok).
+- Prefill + cached decode == cache-free forward (fp32, identical argmax).
+- Greedy generate vs HF pure-greedy generate: **token-for-token identical**, 8 prompts, 503 tokens
+  (7 hit the 64 cap, 1 stopped at EOS). Tests: 55 passed.
+
+Benchmark (same config as the M0 rows): `python -m bench.harness --backend nanoserve --concurrency 1,4,8`
+Results: bench/results/20261110-155214_*
+
+| engine | conc | out tok/s (min-max) | TTFT p50/p99 ms | TPOT p50/p99 ms | E2E p50/p99 s |
+|---|---|---|---|---|---|
+| nanoserve-m1 (bf16, batch 1) | 1 | 40.4 (40-41) | 26 / 51          | 24.4 / 29.5 | 3.13 / 3.78 |
+|                              | 4 | 39.3 (38-41) | 9,496 / 12,040   | 24.7 / 33.5 | 12.62 / 15.38 |
+|                              | 8 | 40.6 (39-41) | 21,988 / 22,765  | 24.4 / 26.5 | 25.08 / 25.87 |
+
+vs M0 at c=1: HF 34.0 tok/s (TPOT 29.2 ms) -> nanoserve 40.4 (+19%, TPOT 24.4 ms); vLLM 120.7 (8.1 ms).
+vs M0 at c=8: HF static batching 185.9 tok/s, vLLM 801.2; nanoserve 40.6 (4.6x behind HF, 20x behind vLLM).
+
+Observations:
+- Throughput is flat across concurrency (~40 tok/s): batch size 1, requests serialized. All extra
+  concurrency becomes queueing: TTFT p50 goes 26 ms -> 9.5 s -> 22 s. This is the M2 target.
+- Faster than HF at c=1 (24.4 vs 29.2 ms TPOT): no generate() machinery, logits processors, or growing
+  DynamicCache concatenation; our cache writes in place.
+- Profile of one decode step (torch.profiler, 50 steps after warmup, cache at ~220 tokens):
+  GPU kernel time 9.0 ms/step, ~1,012 kernel launches/step. Against the real (unprofiled) 24.4 ms TPOT
+  the GPU is busy ~37%; the rest is CPU-side launch/Python overhead (~15 ms / 1,012 ~= 15 us per launch).
+  Profiler inflates wall time (115 ms/step), so only its GPU-side numbers are used.
+- Roofline estimate: ~0.99 GB of weights / ~168 GB/s (assumed laptop 3050 bandwidth, not measured)
+  = ~5.9 ms. GPU-side 9.0 ms is ~65% of that bound; wall 24.4 ms is ~24%.
+- Memory: each request reserves 2048 x 12 KB = 24 MB of KV cache regardless of length; a 128-token
+  benchmark request (~170-720 tokens total) uses 8-35% of it.
+
+What failed: nothing in M1 itself. (Fixed beforehand: repetition_penalty comment said 1.05, real 1.1.)
