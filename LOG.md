@@ -295,3 +295,39 @@ WHY it loses here (bench/runs/m5_costs.py, batch 1, ctx ~300, CUDA events):
   predicts (4 x 6 + 47) / 3.05 = 23 ms/token vs 36.5 -> ~1.6x at c=1. Or a free draft (prompt-lookup /
   n-gram). Classic result reproduced: speculative decoding is a low-load LATENCY tool, and only when the
   draft is much cheaper than the target.
+
+## M6 plan (auto-approved) — server + final benchmark
+- FastAPI server, OpenAI completions + chat, SSE streaming with include_usage, greedy only (reject anything
+  that would change outputs), incremental detokenizer, abort on disconnect. Tested through the SAME client
+  the benchmark uses for vLLM/llama.cpp (httpx ASGI transport).
+- Final benchmark: every engine over HTTP through one client, same session, fixed + varied workloads,
+  c = 1..32; HF in-process baseline; plots; README with an honest gap section.
+
+## 2026-11-11 — M6 results (final)
+Tests: 112 passed (default suite) + 5 passed (pytest -m spec). Server: 6 tests incl. benchmark client
+over ASGI, output == engine greedy, disconnect aborts and frees KV. Live smoke over real uvicorn OK.
+HTTP overhead: nanoserve server vs in-process M4: c=1 27.8 vs 28.6, c=4 107.8 vs 110.0 tok/s (~2%).
+
+Scripts: bench/runs/m6_bench.sh (+ bench/runs/m6_llamacpp_np8.sh), plots: `python -m bench.plot --tag m6`.
+Fixed 128 tokens, tok/s (TPOT p50 ms):
+| engine | c=1 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|---|
+| HF generate (in-process) | 26.9 (36.8) | 87.9 (43.6) | 173.0 (43.4) | - | - |
+| nanoserve server | 27.8 (35.4) | 107.8 (36.6) | 208.4 (37.3) | 379.9 (39.3) | 652.1 (44.0) |
+| llama.cpp 8 slots | 105.1 (9.3) | 193.8 (23.6) | 485.6 (14.3) | - | - |
+| llama.cpp 32 slots | 104.7 (9.3) | 176.4 (23.8) | 214.3 (37.6) | 332.0 (47.7) | 611.7 (45.8) |
+| vLLM 0.33.0 | 121.1 (8.1) | 436.3 (8.7) | 802.4 (9.0) | 1405.2 (9.7) | 2208.1 (11.6) |
+Varied 16-256, tok/s: nanoserve 106.5 / 192.5 / 343.1 / 478.8 (c=4/8/16/32); llama.cpp-np8 170.4 / 391.9;
+llama.cpp-np32 115.6 / 129.3 / 177.9 / 330.0; vLLM 433.5 / 761.1 / 1282.8 / 1722.1.
+TTFT p50 @ varied c=16: nanoserve 101 ms, llama.cpp-np32 220 ms, vLLM 56 ms.
+
+Findings:
+- nanoserve = 23-30% of vLLM throughput; the gap is a ~constant ~4x per-step cost (launch overhead).
+- Beats HF generate from c=4; beats llama.cpp-np32 at c >= 16 and on varied lengths at c >= 8.
+- FAILED/CORRECTED claim: the 32-slot llama.cpp run made nanoserve look competitive at c=8 (208 vs 214).
+  M0 had shown llama.cpp at 478 with 8 slots, so I re-ran the 8-slot config in the same session: 485.6
+  at c=8 (2.3x nanoserve). llama.cpp's speed depends on matching -np to the load; the README reports both.
+- llama.cpp c=4 anomaly from M0 persists (TPOT 23.6 ms at c=4 vs 14.3 at c=8 with 8 slots); not investigated.
+- openai_http: engine names like "llamacpp-np8" now map to the llamacpp fairness flags (prefix match).
+
+Where we lose and why: README.md, "Where we lose, and why".

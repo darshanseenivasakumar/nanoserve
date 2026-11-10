@@ -39,7 +39,7 @@ class OpenAIBackend:
 
     def info(self) -> dict:
         return {"backend": "openai", "engine": self.engine_name, "base_url": self.base_url, "model": self.model,
-                "extra_body": ENGINE_EXTRA_BODY.get(self.engine_name, {})}
+                "extra_body": ENGINE_EXTRA_BODY.get(self.engine_name.split("-")[0], {})}
 
     async def server_version(self) -> str | None:
         """Best-effort engine version string for the results file."""
@@ -66,7 +66,7 @@ class OpenAIBackend:
             "stream_options": {"include_usage": True},
             "ignore_eos": True,
         }
-        body.update(ENGINE_EXTRA_BODY.get(self.engine_name, {}))
+        body.update(ENGINE_EXTRA_BODY.get(self.engine_name.split("-")[0], {}))  # "llamacpp-np8" -> llamacpp flags
         return body
 
     async def generate(self, req: Request) -> RequestRecord:

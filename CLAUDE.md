@@ -49,6 +49,10 @@ simple analogies, and add it to GLOSSARY.md.
 uv sync                                   # install env
 uv run pytest -v                          # all tests (gpu tests included)
 uv run pytest -v -m "not gpu"             # fast tests only
+uv run pytest -m spec                     # speculative-decoding tests (1.5B, ~8 GB RAM), excluded by default
+uv run python -m nanoserve.server --port 8002 --kv-cache-gb 2   # OpenAI-compatible server
+uv run python -m bench.summarize "*_m6.json"   # one line per result file
+uv run python -m bench.plot --tag m6     # plots into bench/plots/
 uv run python -m bench.harness --backend hf --concurrency 1,4,8
 uv run python -m bench.harness --backend openai --base-url http://localhost:8000 --engine-name vllm ...
 uv run python -m bench.harness --backend nanoserve --concurrency 1,4,8   # our engine, in-process

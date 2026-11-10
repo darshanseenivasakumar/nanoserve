@@ -19,7 +19,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 RESULTS = Path(__file__).with_name("results")
-COLORS = {"vllm": "#1f77b4", "llamacpp": "#2ca02c", "hf-generate": "#7f7f7f"}
+COLORS = {"vllm": "#1f77b4", "llamacpp": "#2ca02c", "llamacpp-np8": "#98df8a", "hf-generate": "#7f7f7f"}
 
 
 def load(tag: str) -> dict:
