@@ -24,7 +24,7 @@ from bench.backends.base import Request, RequestRecord
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
 # Pure greedy. Qwen's generation_config.json ships sampling defaults (temperature/top_p/top_k) AND
-# repetition_penalty=1.05, which still applies when do_sample=False. We override all of them so the
+# repetition_penalty=1.1, which still applies when do_sample=False. We override all of them so the
 # baseline is "always pick the argmax token" -- the definition every engine is held to.
 GREEDY = dict(do_sample=False, temperature=None, top_p=None, top_k=None, repetition_penalty=1.0)
 

@@ -50,7 +50,7 @@ async def test_matches_plain_hf_greedy_generate(backend, requests):
         r = await backend.generate(req)
         ids = tok(req.prompt, return_tensors="pt", add_special_tokens=False).to("cuda")
         with torch.no_grad():
-            # Pure greedy reference: override Qwen's generation_config defaults (incl. repetition_penalty=1.05)
+            # Pure greedy reference: override Qwen's generation_config defaults (incl. repetition_penalty=1.1)
             out = model.generate(**ids, max_new_tokens=MAX_TOKENS, min_new_tokens=MAX_TOKENS,
                                  do_sample=False, temperature=None, top_p=None, top_k=None,
                                  repetition_penalty=1.0)

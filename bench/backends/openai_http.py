@@ -18,7 +18,7 @@ from bench.backends.base import Request, RequestRecord
 
 # Per-engine request fields needed for a fair comparison. Documented in CLAUDE.md (methodology).
 ENGINE_EXTRA_BODY: dict[str, dict] = {
-    # vLLM applies the model's generation_config.json defaults; Qwen's has repetition_penalty=1.05.
+    # vLLM applies the model's generation_config.json defaults; Qwen's has repetition_penalty=1.1.
     # Pure greedy means no penalty. (Also launched with --generation-config vllm, belt and braces.)
     "vllm": {"repetition_penalty": 1.0},
     # llama-server reuses a slot's KV cache for a shared prompt prefix by default. Our engine has no
