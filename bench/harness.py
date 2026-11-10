@@ -103,7 +103,8 @@ def make_backend(args) -> Backend:
         return HFBackend(args.model, device=args.device, dtype=args.dtype)
     if args.backend == "nanoserve":
         from bench.backends.nanoserve_inproc import NanoserveBackend
-        return NanoserveBackend(args.model, device=args.device, dtype=args.dtype, max_seq_len=args.max_seq_len)
+        return NanoserveBackend(args.model, device=args.device, dtype=args.dtype, max_seq_len=args.max_seq_len,
+                                policy=args.nanoserve_policy, max_num_batched_tokens=args.max_num_batched_tokens)
     from bench.backends.openai_http import OpenAIBackend
     return OpenAIBackend(args.base_url, model=args.served_model_name or args.model, engine_name=args.engine_name)
 
@@ -134,9 +135,11 @@ async def amain(args) -> int:
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.model)
     prompts = load_prompt_set(args.prompts)
-    requests = build_requests(tokenizer, prompts, args.num_prompts, args.max_tokens, args.seed)
+    rng = args.output_len_range
+    requests = build_requests(tokenizer, prompts, args.num_prompts, args.max_tokens, args.seed, max_tokens_range=rng)
     # Warmup uses a differently-shuffled draw so it doesn't pre-run the exact measured order.
-    warmup = build_requests(tokenizer, prompts, args.warmup, args.max_tokens, args.seed + 1) if args.warmup else []
+    warmup = (build_requests(tokenizer, prompts, args.warmup, args.max_tokens, args.seed + 1, max_tokens_range=rng)
+              if args.warmup else [])
 
     backend = make_backend(args)
     info = backend.info()
@@ -183,6 +186,11 @@ def parse_args(argv=None):
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     p.add_argument("--max-seq-len", type=int, default=2048, help="nanoserve: per-request KV reservation")
+    p.add_argument("--nanoserve-policy", choices=["continuous", "static"], default="continuous")
+    p.add_argument("--max-num-batched-tokens", type=int, default=8192, help="nanoserve: per-step token budget")
+    p.add_argument("--output-len-range", default=None,
+                   type=lambda s: tuple(int(x) for x in s.split(",")),
+                   help="LO,HI: per-request output length drawn (seeded) from [LO, HI] instead of --max-tokens")
     p.add_argument("--base-url", default="http://localhost:8000")
     p.add_argument("--engine-name", default="openai", help="vllm | llamacpp | nanoserve (selects per-engine fairness flags)")
     p.add_argument("--served-model-name", default=None)

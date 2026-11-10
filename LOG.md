@@ -94,3 +94,13 @@ Observations:
   benchmark request (~170-720 tokens total) uses 8-35% of it.
 
 What failed: nothing in M1 itself. (Fixed beforehand: repetition_penalty comment said 1.05, real 1.1.)
+
+## 2026-11-10 — M2 in progress: environment drift found before benchmarking
+- Synchronous LLMEngine.step() timing (200-token prompts, decode): B=1 35.4 ms, B=2 40.3, B=4 48.7,
+  B=8 63.2 ms/step (28 / 50 / 82 / 127 tok/s).
+- B=1 looked like a regression vs M1 (24.4 ms TPOT), so ran an A/B in one session: M1 code (f8aa4b1)
+  now 34-38 ms, M2 code 35-41 ms. => NOT the refactor: the machine got slower since the M1 benchmark.
+- Likely cause: Windows background load 28% CPU (Epic Games Launcher + EOS overlay renderer, Opera),
+  power plan "Balanced". Our decode is CPU/launch-bound, so it tracks CPU availability directly.
+  GPU was at full clock (2025 MHz, P0), so not the GPU.
+- Action: methodology now requires a same-session control (CLAUDE.md). M2 numbers wait for a quiet machine.

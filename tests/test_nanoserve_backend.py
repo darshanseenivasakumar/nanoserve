@@ -1,11 +1,11 @@
-"""M1 step 4: in-process harness backend for our engine."""
+"""In-process harness backend for our engine (M2: continuous/static batching via AsyncEngine)."""
 import asyncio
 
 import pytest
 
 from bench.harness import parse_args
 from bench.prompts import build_requests
-from nanoserve.engine import Engine, load_eos_token_ids
+from nanoserve.engine import LLMEngine, load_eos_token_ids
 from tests.conftest import MODEL
 
 pytestmark = pytest.mark.gpu
@@ -17,7 +17,9 @@ PROMPTS = [{"id": "a", "length": "short", "prompt": "Name three primary colors."
 @pytest.fixture(scope="module")
 def backend(ours_bf16_gpu):
     from bench.backends.nanoserve_inproc import NanoserveBackend
-    return NanoserveBackend(MODEL, engine=Engine(ours_bf16_gpu, load_eos_token_ids(MODEL)))
+    b = NanoserveBackend(MODEL, engine=LLMEngine(ours_bf16_gpu, load_eos_token_ids(MODEL), max_seq_len=1024))
+    yield b
+    asyncio.run(b.close())
 
 
 @pytest.fixture(scope="module")
@@ -33,11 +35,18 @@ async def test_forced_length_and_timestamps(backend, requests):
     assert r.prompt_tokens_reported == requests[0].prompt_tokens
 
 
-async def test_concurrent_requests_run_one_at_a_time(backend, requests):
+async def test_concurrent_requests_overlap(backend, requests):
+    # M1 asserted the opposite (batch size 1). M2 batches concurrent requests together.
     a, b = await asyncio.gather(*(backend.generate(r) for r in requests))
-    first, second = sorted([a, b], key=lambda r: r.t_chunks[0])
-    assert first.t_chunks[-1] <= second.t_chunks[0], "M1 has batch size 1: generations must not overlap"
+    assert max(a.t_chunks[0], b.t_chunks[0]) < min(a.t_chunks[-1], b.t_chunks[-1])
 
 
-def test_harness_accepts_the_backend():
-    assert parse_args(["--backend", "nanoserve"]).backend == "nanoserve"
+def test_batch_size_sets_max_num_seqs(backend):
+    backend.batch_size = 5
+    assert backend.llm.scheduler.max_num_seqs == 5
+
+
+def test_harness_accepts_the_backend_and_policy():
+    args = parse_args(["--backend", "nanoserve", "--nanoserve-policy", "static", "--output-len-range", "16,256"])
+    assert args.backend == "nanoserve" and args.nanoserve_policy == "static"
+    assert args.output_len_range == (16, 256)

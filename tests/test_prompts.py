@@ -39,6 +39,18 @@ def test_build_requests_is_deterministic_per_seed():
     assert a != c
 
 
+def test_varied_output_lengths_are_seeded_and_leave_prompt_order_unchanged():
+    prompts = load_prompt_set(DEFAULT_PROMPTS_PATH)
+    tok = FakeTokenizer()
+    fixed = build_requests(tok, prompts, 30, 128, seed=0)
+    a = build_requests(tok, prompts, 30, 128, seed=0, max_tokens_range=(16, 256))
+    b = build_requests(tok, prompts, 30, 128, seed=0, max_tokens_range=(16, 256))
+    assert [r.prompt for r in a] == [r.prompt for r in fixed]       # same prompts, same order
+    assert [r.max_tokens for r in a] == [r.max_tokens for r in b]   # reproducible
+    assert all(16 <= r.max_tokens <= 256 for r in a)
+    assert len({r.max_tokens for r in a}) > 10                      # actually varied
+
+
 def test_build_requests_cycles_when_asking_for_more_than_the_set():
     prompts = [{"id": str(i), "length": "short", "prompt": f"p{i}"} for i in range(3)]
     reqs = build_requests(FakeTokenizer(), prompts, num_prompts=7, max_tokens=8, seed=0)

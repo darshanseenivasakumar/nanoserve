@@ -66,4 +66,7 @@ bash bench/servers/llamacpp.sh            # start llama-server
 - Greedy (temperature 0), **fixed output length** (`ignore_eos` / `min_new_tokens`) so every engine does
   identical work. Chat template applied once by us; raw text sent to every engine; engine-reported prompt
   token count is checked against ours.
+- Before any benchmark: close background apps (games/launchers/browsers), plug in, max-performance power
+  mode, and run a CONTROL in the same session (re-measure the previous milestone at c=1). Decode here is
+  CPU/launch-bound, so background CPU load moves TPOT by 40%+ (seen 24 -> 35 ms during M2).
 - Metrics: output tok/s, request/s, TTFT, TPOT, E2E latency p50/p99 (with sample counts).
