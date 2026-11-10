@@ -25,25 +25,49 @@ class NanoserveBackend:
     def __init__(self, model_name: str, device: str = "cuda", dtype: str = "bfloat16", max_seq_len: int = 2048,
                  policy: str = "continuous", max_num_batched_tokens: int = 8192, kv_cache: str = "paged",
                  kv_cache_tokens: int | None = None, block_size: int = 16, attn_backend: str | None = None,
-                 engine: LLMEngine | None = None):
+                 draft_model: str | None = None, num_speculative_tokens: int = 4, engine: LLMEngine | None = None):
         self.model_name = model_name
-        self.llm = engine or LLMEngine.from_pretrained(model_name, device=device, dtype=DTYPES[dtype],
-                                                       max_seq_len=max_seq_len, policy=policy,
-                                                       max_num_batched_tokens=max_num_batched_tokens,
-                                                       kv_cache=kv_cache, kv_cache_tokens=kv_cache_tokens,
-                                                       block_size=block_size, attn_backend=attn_backend)
+        self.spec = draft_model is not None
+        if self.spec:
+            # M5: speculative decoding (target = model_name, draft = draft_model).
+            from nanoserve.engine import load_eos_token_ids
+            from nanoserve.model import Qwen2Model
+            from nanoserve.speculative import SpeculativeEngine
+            target = Qwen2Model.from_pretrained(model_name, device=device, dtype=DTYPES[dtype])
+            draft = Qwen2Model.from_pretrained(draft_model, device=device, dtype=DTYPES[dtype])
+            self.llm = SpeculativeEngine(target, draft, load_eos_token_ids(model_name),
+                                         num_speculative_tokens=num_speculative_tokens, max_seq_len=max_seq_len,
+                                         max_num_batched_tokens=max_num_batched_tokens,
+                                         target_kv_tokens=kv_cache_tokens, block_size=block_size)
+            self.draft_model = draft_model
+        else:
+            self.llm = engine or LLMEngine.from_pretrained(model_name, device=device, dtype=DTYPES[dtype],
+                                                           max_seq_len=max_seq_len, policy=policy,
+                                                           max_num_batched_tokens=max_num_batched_tokens,
+                                                           kv_cache=kv_cache, kv_cache_tokens=kv_cache_tokens,
+                                                           block_size=block_size, attn_backend=attn_backend)
         self.engine = AsyncEngine(self.llm)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     @property
     def batch_size(self) -> int:
-        return self.llm.scheduler.max_num_seqs
+        return self.llm.max_num_seqs if self.spec else self.llm.scheduler.max_num_seqs
 
     @batch_size.setter
     def batch_size(self, n: int) -> None:
-        self.llm.scheduler.max_num_seqs = n
+        if self.spec:
+            self.llm.max_num_seqs = n
+        else:
+            self.llm.scheduler.max_num_seqs = n
 
     def info(self) -> dict:
+        if self.spec:
+            e = self.llm
+            return {"backend": "nanoserve", "engine": f"nanoserve-spec-k{e.k}", "model": self.model_name,
+                    "draft_model": self.draft_model, "num_speculative_tokens": e.k,
+                    "dtype": str(e.target.dtype).replace("torch.", ""), "kv_cache": "paged (reserved per request)",
+                    "target_kv_tokens": e.tpool.num_blocks * e.block_size, "attn_backend": "sdpa",
+                    "max_seq_len": e.max_seq_len, "torch": torch.__version__}
         m, s = self.llm.model, self.llm.scheduler
         kv = self.llm.kv
         name = f"nanoserve-{kv.kind}-{s.policy}" + ("-triton" if self.llm.attn_backend == "triton" else "")

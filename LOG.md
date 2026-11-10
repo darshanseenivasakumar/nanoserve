@@ -260,3 +260,38 @@ End-to-end (bench/runs/m4_bench.sh; same session; paged, 2 GiB budget, continuou
 - vs same-session-ish references: HF static c=8 183.7 -> we now beat it (215); vLLM c=8 803.8 / c=32
   2212.6 -> we are at 27% / 33%. Remaining gap = the flat ~35 ms base step vs vLLM's ~8 ms: ~1,000
   Python-launched kernels per step (vLLM replays CUDA graphs) -- see README "where we lose".
+
+## M5 plan (auto-approved) — speculative decoding
+- Target Qwen2.5-1.5B-Instruct (downloaded, 3.09 GB), draft Qwen2.5-0.5B-Instruct (same vocab). Greedy,
+  fixed lookahead k. Draft proposes k (first step catches up on unseen tokens), target verifies k+1
+  positions in one forward (logits only for those rows), accept longest matching prefix + target token,
+  rewind both paged caches. Blocks reserved per request at admission (no preemption); SDPA for both models.
+- Gates: output == plain greedy target, fp32 strict; bf16 tie rule; self-speculation sanity check.
+- Tests run separately (pytest -m spec): 1.5B fp32 on CPU needs ~6 GB RAM.
+
+## 2026-11-11 — M5 results
+Correctness (pytest -m spec: 5 passed): self-speculation acceptance 1.000 + identical; **0.5B -> 1.5B fp32
+output token-for-token identical to plain greedy 1.5B** (acceptance 0.625, 3.06 tokens/target forward);
+batched == one-at-a-time; bf16 acceptance 0.603, 3/4 identical + 1 near-tie (0.125).
+
+Benchmark (bench/runs/m5_bench.sh; 1.5B target, 32 prompts x 128 forced tokens, 2 repeats, 0.25 GiB
+target KV, same session; peak VRAM 4,980 MiB, no spill):
+| 1.5B | c=1 tok/s | c=1 TPOT p50 | c=4 tok/s | c=4 TPOT p50 | acceptance |
+|---|---|---|---|---|---|
+| plain greedy (paged + Triton) | 23.2 | 42.9 ms | 87.6 | 44.3 ms | - |
+| speculative k=2 | 19.1 (0.82x) | 51.6 ms | 45.4 (0.52x) | 83.6 ms | 0.66-0.67 |
+| speculative k=4 | 16.5 (0.71x) | 61.5 ms | 40.7 (0.46x) | 88.7 ms | 0.53 |
+(tokens_per_target_forward in the result JSON counts all requests of a batch: c=4 k=4 11.05 = ~2.8/request.)
+
+WHY it loses here (bench/runs/m5_costs.py, batch 1, ctx ~300, CUDA events):
+  target 1.5B 1-token forward 36.5 ms | draft 0.5B 1-token forward 31.5 ms | target verify 5 tokens 47.3 ms
+- Verification IS nearly free (5 tokens cost 1.3x one token) -- the premise of speculative decoding holds.
+- But the draft is NOT cheap: 0.86x the target's cost, because both forwards are dominated by ~1,000
+  Python-launched kernels (launch-bound), not by weight reads. A k=4 step costs 4 x 31.5 + 47.3 = 173 ms
+  and must emit >= 4.7 tokens to break even; it emits ~3.05. Predicted 0.64x vs measured 0.71x (c=1).
+- At c=4 it is worse still: plain decoding already shares each step across 4 requests (TPOT flat), while
+  the speculative engine runs k+1 serial forwards per step on the SDPA path (no Triton kernel there).
+- What would make it win: a draft forward of ~6 ms (CUDA graphs; memory floor for 0.5B on this GPU)
+  predicts (4 x 6 + 47) / 3.05 = 23 ms/token vs 36.5 -> ~1.6x at c=1. Or a free draft (prompt-lookup /
+  n-gram). Classic result reproduced: speculative decoding is a low-load LATENCY tool, and only when the
+  draft is much cheaper than the target.
