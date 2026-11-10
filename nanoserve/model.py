@@ -95,9 +95,16 @@ class LayerWeights:
 
 @dataclass
 class SeqInput:
-    """One sequence's slice of a batched step: how many of the flattened tokens are its, and its cache."""
+    """One sequence's slice of a batched step: how many of the flattened tokens are its, and its KV.
+
+    Contiguous (M1/M2): `cache` = a per-request ContiguousKVCache.
+    Paged (M3):         `block_table` = this request's block ids (int tensor), `ctx_len` = tokens already
+                        stored before this step; the pool + slot mapping are passed to forward_batch.
+    """
     n_tokens: int
-    cache: object | None = None   # a KV cache with .length / .write(layer, k, v) / .advance(T), or None
+    cache: object | None = None
+    block_table: torch.Tensor | None = None
+    ctx_len: int = 0
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -159,7 +166,7 @@ class Qwen2Model:
         return emb.cos().to(self.dtype), emb.sin().to(self.dtype)
 
     def _attention(self, i: int, layer: LayerWeights, h: torch.Tensor, cos, sin,
-                   seqs: list[SeqInput]) -> torch.Tensor:
+                   seqs: list[SeqInput], paged=None, slot_mapping=None) -> torch.Tensor:
         """h: [1, N, hidden] = the flattened tokens of every sequence in this step.
 
         SELECTIVE BATCHING: the Q/K/V/O projections and RoPE are token-wise, so they run ONCE over all N
@@ -174,19 +181,40 @@ class Qwen2Model:
         c, s = cos.unsqueeze(2), sin.unsqueeze(2)                   # [1, N, 1, hd]: broadcast over heads
         q = q * c + rotate_half(q) * s
         k = k * c + rotate_half(k) * s
+        if paged is not None:
+            # Paged (M3): store every token's K/V of this step with ONE indexed copy (slot mapping).
+            paged.write(i, k[0], v[0], slot_mapping)
         outs, start = [], 0
         for seq in seqs:
             T = seq.n_tokens
             qs = q[:, start:start + T].transpose(1, 2)              # [1, n_heads, T, hd]
             ks = k[:, start:start + T].transpose(1, 2)
             vs = v[:, start:start + T].transpose(1, 2)
-            if seq.cache is not None:
-                # Store this step's K/V, get back K/V for ALL tokens so far (cached + new).
+            mask = None
+            if paged is not None and seq.ctx_len > 0:
+                # Read this request's whole context (cached + this step's tokens) out of its blocks.
+                ks, vs = paged.gather(i, seq.block_table, seq.ctx_len + T)
+                if T > 1:
+                    # Several new tokens on top of a context (spec-decode verification, M5): query j may
+                    # see keys 0 .. ctx_len + j. SDPA's is_causal would align the wrong corner, so build it.
+                    L = seq.ctx_len + T
+                    mask = torch.arange(L, device=qs.device)[None, :] <= (seq.ctx_len + torch.arange(T, device=qs.device))[:, None]
+            elif seq.cache is not None:
+                # Contiguous (M1/M2): store this step's K/V, get back K/V for ALL tokens so far.
                 ks, vs = seq.cache.write(i, ks, vs)
+            if mask is not None:
+                # enable_gqa is not supported together with an explicit mask on every SDPA backend, so
+                # expand the K/V heads to match the query heads (what HF's repeat_kv does).
+                rep = qs.shape[1] // ks.shape[1]
+                ks, vs = ks.repeat_interleave(rep, dim=1), vs.repeat_interleave(rep, dim=1)
+                o = F.scaled_dot_product_attention(qs, ks, vs, attn_mask=mask, scale=hd ** -0.5)
+                outs.append(o.transpose(1, 2).contiguous().reshape(1, T, -1).contiguous())
+                start += T
+                continue
             # is_causal only for multi-token steps (prefill): token t must not see tokens > t.
             # A single decode token may see its whole cache, so no mask is needed.
             # NOTE: SDPA's is_causal assumes queries and keys start at the same position, so a multi-token
-            # step on top of a non-empty cache (chunked prefill) would be WRONG. forward_batch forbids it.
+            # step on top of a non-empty CONTIGUOUS cache would be WRONG; forward_batch forbids it.
             o = F.scaled_dot_product_attention(qs, ks, vs, is_causal=T > 1, scale=hd ** -0.5, enable_gqa=True)
             outs.append(o.transpose(1, 2).contiguous().reshape(1, T, -1).contiguous())
             start += T
@@ -195,7 +223,7 @@ class Qwen2Model:
 
     @torch.inference_mode()
     def forward_batch(self, token_ids: torch.Tensor, positions: torch.Tensor, seqs: list[SeqInput],
-                      logits: str = "last") -> torch.Tensor:
+                      logits: str = "last", paged=None, slot_mapping: torch.Tensor | None = None) -> torch.Tensor:
         """One forward pass over several sequences, each either PREFILLING (many tokens, empty cache) or
         DECODING (one token on top of its cache).
 
@@ -210,7 +238,7 @@ class Qwen2Model:
         cos, sin = self.rope(positions)
         eps = self.cfg.rms_norm_eps
         for i, layer in enumerate(self.layers):
-            x = x + self._attention(i, layer, rms_norm(x, layer.ln1, eps), cos, sin, seqs)
+            x = x + self._attention(i, layer, rms_norm(x, layer.ln1, eps), cos, sin, seqs, paged, slot_mapping)
             h = rms_norm(x, layer.ln2, eps)
             x = x + F.linear(F.silu(F.linear(h, layer.gate_w)) * F.linear(h, layer.up_w), layer.down_w)
         for seq in seqs:

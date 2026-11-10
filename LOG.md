@@ -165,3 +165,26 @@ What failed / changed along the way:
 - Test changed (rule 6): M1's "requests are serialized" test replaced by "requests overlap" (M2 intent).
 - My benchmark-log grep missed nanoserve rows (engine name has a hyphen); all results were saved,
   read back with the new bench/summarize.py.
+
+## 2026-11-11 — Autonomous mode
+User, 00:11: "im going to sleepp dont ask anything, u finish the whole project". From here on, each
+milestone plan is written here and treated as approved (rule 5 waived by this instruction). Tests-first,
+one change per measurement, and commit-with-numbers still apply. Judgment calls are marked DECISION.
+
+## M3 plan (auto-approved) — paged KV cache
+- Pool per layer [num_blocks, 16, kv_heads, head_dim], free list, per-request block table, slot mapping
+  (one indexed write per layer for all requests). Block size 16 (vLLM default): average waste half a
+  block per request; smaller blocks mean longer tables and more gather work.
+- Admission by an EXPLICIT token budget (not by OOM: Windows sysmem fallback hides OOM). Contiguous mode
+  gets the same budget (capacity = budget / max_seq_len) so the comparison is fair.
+- Out of blocks during decode: preempt the most recently admitted request (LIFO), free its blocks,
+  put it back at the FRONT of the queue, and later recompute its KV by re-prefilling prompt + generated
+  tokens (vLLM's default "recompute" preemption; the alternative, swapping KV to CPU, isn't built).
+  Requests that could never fit even alone are rejected on arrival.
+- Attention before M4: gather each request's blocks into a dense tensor, then SDPA (an extra copy;
+  expected to cost a little speed until the Triton kernel in M4).
+- Measures: (1) max concurrent requests under the same 2 GiB budget, contiguous vs paged;
+  (2) KV utilisation (used / reserved); (3) throughput/latency vs M2 in the same session;
+  (4) preemption count and its effect on correctness.
+- Correctness: paged == contiguous token-for-token (fp32 strict; bf16 tie rule); preempted+recomputed
+  requests == never-preempted (fp32 strict; bf16 tie rule); no leaked blocks after a run.

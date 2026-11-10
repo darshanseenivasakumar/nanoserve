@@ -98,9 +98,8 @@ class AsyncEngine:
                 for loop, q in self._streams.values():
                     self._send(loop, q, e)
                 self._streams.clear()
-                self.engine.scheduler.waiting.clear()
-                self.engine.scheduler.running.clear()
-                self.engine.sequences.clear()
+                for sid in list(self.engine.sequences):
+                    self.engine.abort(sid)                # frees their KV blocks too
                 continue
             if not outputs:                               # e.g. static policy waiting for its batch to fill
                 time.sleep(0.001)
