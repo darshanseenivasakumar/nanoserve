@@ -109,8 +109,9 @@ def paged_attention_reference(q, k_pool, v_pool, block_tables, context_lens, sca
     """Plain PyTorch: gather each request's blocks, then SDPA (the M3 path). Used as the test oracle."""
     outs = []
     block_size, n_kv_heads, head_dim = k_pool.shape[1:]
+    lens = context_lens.tolist()   # ONE device->host copy (a per-request int() would sync B times)
     for b in range(q.shape[0]):
-        L = int(context_lens[b])
+        L = lens[b]
         nb = -(-L // block_size)
         blocks = block_tables[b, :nb].long()
         k = k_pool[blocks].reshape(-1, n_kv_heads, head_dim)[:L].transpose(0, 1)[None]

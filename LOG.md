@@ -219,3 +219,44 @@ Machine note: c=1 TPOT 33 ms again (the laptop stayed ~20-35% slower than during
 DECISION/flag: these M3 runs used the working tree with the M4 kernel code present but attention pinned
 to SDPA ("TEMP during M3 benchmark" line in engine.py), i.e. the M3 code path. A first attempt at this
 benchmark died silently (background job killed when its wsl.exe call returned; nothing recorded).
+
+## M4 plan (auto-approved) — Triton paged-attention decode kernel
+- One launch per layer for ALL one-token decodes; grid (request, kv_head); each program handles the
+  GROUP query heads sharing a kv head (pads to 16 for tl.dot); walks the block table, reads K/V tiles in
+  place, online softmax. Prefills and multi-token steps stay on SDPA.
+- Gates: op-level vs gather+SDPA oracle: fp32 (IEEE dot) <= 1e-5, bf16 <= 1e-2 vs fp32 oracle, shapes of
+  0.5B/1.5B/3B, partial blocks, fragmented tables. Engine-level bf16 tie rule vs the SDPA engine.
+- Process flag (rule 3): the kernel was written before its test (both while the M3 benchmark ran); the
+  test ran and passed before any integration or measurement.
+
+## 2026-11-11 — M4 results
+Correctness: kernel fp32 max|diff| <= 1e-5 (all shapes); bf16 3.8e-3 / 4.5e-3 / 4.1e-3 vs fp32 oracle
+(0.5B / 1.5B / 3B shapes). Engine triton vs sdpa (bf16, 12 staggered requests): 10/12 identical, 2
+diverge at near-ties (gaps 0.062, 0.125). Full suite: 106 passed. M1's single-request Engine stays on
+SDPA on purpose (it is the reference that must equal HF bitwise).
+
+Microbenchmark (bench/runs/m4_kernel_microbench.py; one layer, bf16, 0.5B shapes, CUDA events, median of 50):
+| ctx \ B | 1 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|
+| 128  triton / gather+SDPA ms | 0.079 / 0.331 | 0.102 / 0.756 | 0.096 / 1.425 | 0.073 / 2.741 | 0.068 / 5.538 |
+| 512  | 0.098 / 0.381 | 0.086 / 1.023 | 0.109 / 1.528 | 0.087 / 2.906 | 0.113 / 5.768 |
+| 1024 | 0.103 / 0.346 | 0.118 / 0.809 | 0.119 / 1.724 | 0.124 / 2.926 | 0.156 / 5.510 |
+Speedup 3.4-4.2x at B=1, ~14x at B=8, 35-81x at B=32: the kernel's cost is ~flat in B (one launch);
+the loop pays ~0.17 ms per request per layer. Per decode step (24 layers, B=8, ctx 512): 2.6 vs 36.7 ms.
+FAILED first: my first microbench reference did int(context_lens[b]) inside its loop = one host-device
+sync per request, which the engine never does -> speedups overstated (up to 115x). Fixed the reference to
+sync once (.tolist()) and re-ran; numbers above are the fair ones.
+
+End-to-end (bench/runs/m4_bench.sh; same session; paged, 2 GiB budget, continuous batching):
+| tok/s | c=1 | c=4 | c=8 | c=16 | c=32 | var c=8 | var c=16 |
+|---|---|---|---|---|---|---|---|
+| M3 paged gather+SDPA (c=8: same-session control; rest from M3 run) | 30.3 | 89.5 | 130.8 | 182.6 | 221.0 | 129.1 | 171.6 |
+| **M4 paged + Triton kernel** | 28.6 | 110.0 | **215.2** | **402.9** | **730.5** | 205.9 | 368.3 |
+| TPOT p50 ms, M4 | 34.8 | 35.8 | 36.1 | 37.8 | 39.9 | 35.8 | 37.7 |
+- TPOT is now nearly FLAT in concurrency (35.8 -> 39.9 ms from c=4 to c=32; M3: 43 -> 142 ms). The
+  per-request cost of attention is gone; what remains is the fixed per-step cost.
+- c=1 doesn't improve (34.8 vs 33.0 ms): with one request the step is launch/Python-bound, and the
+  kernel path launches about as many ops as it removes (index, kernel, buffer, index_copy).
+- vs same-session-ish references: HF static c=8 183.7 -> we now beat it (215); vLLM c=8 803.8 / c=32
+  2212.6 -> we are at 27% / 33%. Remaining gap = the flat ~35 ms base step vs vLLM's ~8 ms: ~1,000
+  Python-launched kernels per step (vLLM replays CUDA graphs) -- see README "where we lose".

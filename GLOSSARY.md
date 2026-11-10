@@ -141,6 +141,58 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
 - **Control measurement**: re-measuring a known reference in the same session so a comparison isn't
   polluted by the machine changing (background load, heat, power mode).
 
+## Paged KV cache (M3)
+- **Paging / PagedAttention** (vLLM, SOSP 2023): store KV in fixed-size blocks from one shared pool, like
+  an operating system stores memory in pages. A request's blocks don't have to be next to each other.
+- **Block / block size**: a fixed chunk of KV storage (16 tokens here). Smaller blocks waste less memory at
+  the end of each request but mean longer tables and more lookups.
+- **Block table**: a request's list of block ids, in order (its "page table"). Token t lives in block
+  table[t // block_size] at offset t % block_size.
+- **Free list / block allocator**: the pile of unused block ids; allocate pops one, free pushes it back.
+- **Slot mapping**: the flat pool position of each new token (block_id x block_size + offset), so ONE
+  indexed copy writes every request's new K/V in a step.
+- **Gather**: copying a request's scattered blocks into one dense tensor (needed before SDPA; M4 removes it).
+- **KV utilisation**: tokens actually stored / tokens reserved. Contiguous: ~11%. Paged: ~97%.
+- **Preemption**: kicking a running request out when memory runs out, to let the others continue.
+- **Recompute preemption**: the evicted request keeps its generated tokens but loses its KV; when it comes
+  back it rebuilds the KV with one prefill over prompt + outputs. (vLLM's alternative: swap KV to CPU.)
+- **LIFO victim**: evict the most recently admitted request first: it has done the least work.
+- **Watermark**: a few blocks kept free at admission so a just-admitted request doesn't immediately force
+  a preemption.
+- **Admission control**: deciding whether a waiting request may start, here by an explicit KV budget.
+
+## Kernels (M4)
+- **Triton program / grid**: Triton launches many copies ("programs") of a kernel; the grid says how many.
+  Ours: one program per (decoding request, KV head).
+- **Tile**: a small 2-D block of data a program loads and works on at once (here [16 tokens x head_dim]).
+- **Online softmax**: computing softmax over data that arrives in chunks: keep a running max and running
+  sum, rescale earlier partial results when the max grows. The core trick of FlashAttention.
+- **Flash-decoding / split-K**: splitting one long context across several programs and merging the
+  partial results; adds parallelism for few, long requests. Not implemented here.
+- **Microbenchmark**: timing one operation in isolation (one layer's attention), vs end-to-end benchmark.
+- **CUDA events**: GPU-side timestamps; the honest way to time GPU work.
+- **Host-device sync**: any time Python needs a GPU value (`int(tensor)`, `.tolist()`), the CPU waits for
+  the GPU to finish. One per request in a loop can dominate the cost.
+
+## Speculative decoding (M5)
+- **Draft model / target model**: a small fast model guesses tokens; the big model checks them.
+- **Lookahead k**: how many tokens the draft guesses per step (4 here).
+- **Verification**: the target runs ONE forward pass over [newest token + k drafts] and gets its own
+  greedy choice at every position.
+- **Acceptance rate**: fraction of drafted tokens the target agreed with.
+- **Bonus token**: if all k drafts are accepted, the target's choice after the last one is also free.
+- **Rewind / rollback**: forgetting cached K/V for rejected draft tokens.
+- **Lossless (greedy) speculative decoding**: every emitted token is exactly the target's greedy choice,
+  so the output is identical to running the target alone; only speed changes.
+
+## Serving (M6)
+- **ASGI / FastAPI / uvicorn**: Python's async web-server interface, a framework on top of it, and the server
+  process that runs it.
+- **Incremental detokenisation**: turning a growing list of token ids into text pieces without ever
+  emitting half of a multi-byte character.
+- **finish_reason**: why a completion ended: "stop" (EOS) or "length" (max_tokens).
+- **Client disconnect / abort**: when the client goes away mid-stream, stop generating and free its KV.
+
 ## Tooling
 - **uv**: a fast Python package/project manager. `uv sync` installs exactly what `pyproject.toml`/`uv.lock` say.
 - **venv (virtual environment)**: an isolated folder of Python packages. vLLM gets its own because it pins a

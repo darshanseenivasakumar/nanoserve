@@ -68,7 +68,7 @@ class LLMEngine:
         self.max_seq_len = max_seq_len
         budget = kv_cache_tokens if kv_cache_tokens is not None else 32 * max_seq_len
         if attn_backend is None:   # M4 default: the Triton kernel wherever there is a GPU
-            attn_backend = "sdpa"   # TEMP during M3 benchmark; M4 flips this to triton on CUDA
+            attn_backend = "triton" if (kv_cache == "paged" and model.device.type == "cuda") else "sdpa"
         self.attn_backend = attn_backend
         if kv_cache == "paged":
             self.kv = PagedKVManager(model.cfg, budget, block_size, device=model.device, dtype=model.dtype,

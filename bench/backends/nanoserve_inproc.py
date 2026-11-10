@@ -24,13 +24,14 @@ DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch
 class NanoserveBackend:
     def __init__(self, model_name: str, device: str = "cuda", dtype: str = "bfloat16", max_seq_len: int = 2048,
                  policy: str = "continuous", max_num_batched_tokens: int = 8192, kv_cache: str = "paged",
-                 kv_cache_tokens: int | None = None, block_size: int = 16, engine: LLMEngine | None = None):
+                 kv_cache_tokens: int | None = None, block_size: int = 16, attn_backend: str | None = None,
+                 engine: LLMEngine | None = None):
         self.model_name = model_name
         self.llm = engine or LLMEngine.from_pretrained(model_name, device=device, dtype=DTYPES[dtype],
                                                        max_seq_len=max_seq_len, policy=policy,
                                                        max_num_batched_tokens=max_num_batched_tokens,
                                                        kv_cache=kv_cache, kv_cache_tokens=kv_cache_tokens,
-                                                       block_size=block_size)
+                                                       block_size=block_size, attn_backend=attn_backend)
         self.engine = AsyncEngine(self.llm)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -45,7 +46,9 @@ class NanoserveBackend:
     def info(self) -> dict:
         m, s = self.llm.model, self.llm.scheduler
         kv = self.llm.kv
-        return {"backend": "nanoserve", "engine": f"nanoserve-{kv.kind}-{s.policy}", "model": self.model_name,
+        name = f"nanoserve-{kv.kind}-{s.policy}" + ("-triton" if self.llm.attn_backend == "triton" else "")
+        return {"backend": "nanoserve", "engine": name, "model": self.model_name,
+                "attn_backend": self.llm.attn_backend,
                 "device": str(m.device), "dtype": str(m.dtype).replace("torch.", ""),
                 "batching": s.policy, "max_num_batched_tokens": s.max_num_batched_tokens,
                 "batch_wait_s": s.batch_wait_s, "kv_cache": kv.kind,

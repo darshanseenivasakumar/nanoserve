@@ -105,7 +105,7 @@ def make_backend(args) -> Backend:
         from bench.backends.nanoserve_inproc import NanoserveBackend
         return NanoserveBackend(args.model, device=args.device, dtype=args.dtype, max_seq_len=args.max_seq_len,
                                 policy=args.nanoserve_policy, max_num_batched_tokens=args.max_num_batched_tokens,
-                                kv_cache=args.kv_cache, block_size=args.block_size,
+                                kv_cache=args.kv_cache, block_size=args.block_size, attn_backend=args.attn_backend,
                                 kv_cache_tokens=(int(args.kv_cache_gb * 2**30) // _kv_bytes_per_token(args)
                                                  if args.kv_cache_gb else None))
     from bench.backends.openai_http import OpenAIBackend
@@ -203,6 +203,8 @@ def parse_args(argv=None):
     p.add_argument("--kv-cache", choices=["paged", "contiguous"], default="paged", help="nanoserve KV cache")
     p.add_argument("--kv-cache-gb", type=float, default=None, help="nanoserve: explicit KV budget in GiB")
     p.add_argument("--block-size", type=int, default=16, help="nanoserve paged KV block size")
+    p.add_argument("--attn-backend", choices=["triton", "sdpa"], default=None,
+                   help="nanoserve attention (default: triton kernel on GPU for the paged cache)")
     p.add_argument("--max-num-batched-tokens", type=int, default=8192, help="nanoserve: per-step token budget")
     p.add_argument("--output-len-range", default=None,
                    type=lambda s: tuple(int(x) for x in s.split(",")),
