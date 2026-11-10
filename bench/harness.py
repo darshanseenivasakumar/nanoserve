@@ -104,9 +104,19 @@ def make_backend(args) -> Backend:
     if args.backend == "nanoserve":
         from bench.backends.nanoserve_inproc import NanoserveBackend
         return NanoserveBackend(args.model, device=args.device, dtype=args.dtype, max_seq_len=args.max_seq_len,
-                                policy=args.nanoserve_policy, max_num_batched_tokens=args.max_num_batched_tokens)
+                                policy=args.nanoserve_policy, max_num_batched_tokens=args.max_num_batched_tokens,
+                                kv_cache=args.kv_cache, block_size=args.block_size,
+                                kv_cache_tokens=(int(args.kv_cache_gb * 2**30) // _kv_bytes_per_token(args)
+                                                 if args.kv_cache_gb else None))
     from bench.backends.openai_http import OpenAIBackend
     return OpenAIBackend(args.base_url, model=args.served_model_name or args.model, engine_name=args.engine_name)
+
+
+def _kv_bytes_per_token(args) -> int:
+    from nanoserve.model import ModelConfig
+    import torch
+    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
+    return ModelConfig.from_pretrained(args.model).kv_bytes_per_token(dtype)
 
 
 async def bench_level(backend, args, concurrency: int, requests, warmup_requests) -> dict:
@@ -114,6 +124,8 @@ async def bench_level(backend, args, concurrency: int, requests, warmup_requests
         backend.batch_size = concurrency
     if warmup_requests:
         await run_closed_loop(backend, warmup_requests, concurrency)
+    if hasattr(backend, "reset_engine_stats"):
+        backend.reset_engine_stats()
     runs = []
     for i in range(args.repeats):
         records, wall = await run_closed_loop(backend, requests, concurrency)
@@ -127,7 +139,8 @@ async def bench_level(backend, args, concurrency: int, requests, warmup_requests
             "summary": median_run["summary"],
             "spread": {"output_tok_per_s_min": min(tps), "output_tok_per_s_max": max(tps),
                        "output_tok_per_s_stdev": statistics.stdev(tps) if len(tps) > 1 else 0.0},
-            "problems": sorted({p for r in runs for p in r["problems"]})}
+            "problems": sorted({p for r in runs for p in r["problems"]}),
+            "engine_stats": backend.engine_stats() if hasattr(backend, "engine_stats") else None}
 
 
 async def amain(args) -> int:
@@ -187,6 +200,9 @@ def parse_args(argv=None):
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     p.add_argument("--max-seq-len", type=int, default=2048, help="nanoserve: per-request KV reservation")
     p.add_argument("--nanoserve-policy", choices=["continuous", "static"], default="continuous")
+    p.add_argument("--kv-cache", choices=["paged", "contiguous"], default="paged", help="nanoserve KV cache")
+    p.add_argument("--kv-cache-gb", type=float, default=None, help="nanoserve: explicit KV budget in GiB")
+    p.add_argument("--block-size", type=int, default=16, help="nanoserve paged KV block size")
     p.add_argument("--max-num-batched-tokens", type=int, default=8192, help="nanoserve: per-step token budget")
     p.add_argument("--output-len-range", default=None,
                    type=lambda s: tuple(int(x) for x in s.split(",")),

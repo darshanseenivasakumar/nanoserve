@@ -23,11 +23,14 @@ DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch
 
 class NanoserveBackend:
     def __init__(self, model_name: str, device: str = "cuda", dtype: str = "bfloat16", max_seq_len: int = 2048,
-                 policy: str = "continuous", max_num_batched_tokens: int = 8192, engine: LLMEngine | None = None):
+                 policy: str = "continuous", max_num_batched_tokens: int = 8192, kv_cache: str = "paged",
+                 kv_cache_tokens: int | None = None, block_size: int = 16, engine: LLMEngine | None = None):
         self.model_name = model_name
         self.llm = engine or LLMEngine.from_pretrained(model_name, device=device, dtype=DTYPES[dtype],
                                                        max_seq_len=max_seq_len, policy=policy,
-                                                       max_num_batched_tokens=max_num_batched_tokens)
+                                                       max_num_batched_tokens=max_num_batched_tokens,
+                                                       kv_cache=kv_cache, kv_cache_tokens=kv_cache_tokens,
+                                                       block_size=block_size)
         self.engine = AsyncEngine(self.llm)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -41,11 +44,20 @@ class NanoserveBackend:
 
     def info(self) -> dict:
         m, s = self.llm.model, self.llm.scheduler
-        return {"backend": "nanoserve", "engine": f"nanoserve-m2-{s.policy}", "model": self.model_name,
+        kv = self.llm.kv
+        return {"backend": "nanoserve", "engine": f"nanoserve-{kv.kind}-{s.policy}", "model": self.model_name,
                 "device": str(m.device), "dtype": str(m.dtype).replace("torch.", ""),
                 "batching": s.policy, "max_num_batched_tokens": s.max_num_batched_tokens,
-                "batch_wait_s": s.batch_wait_s, "kv_cache": "contiguous per request",
+                "batch_wait_s": s.batch_wait_s, "kv_cache": kv.kind,
+                "kv_cache_tokens": (kv.pool.num_blocks * kv.block_size if kv.kind == "paged"
+                                    else kv.capacity * kv.max_seq_len),
                 "max_seq_len": self.llm.max_seq_len, "torch": torch.__version__}
+
+    def reset_engine_stats(self) -> None:
+        self.llm.reset_stats()
+
+    def engine_stats(self) -> dict:
+        return self.llm.stats
 
     async def close(self) -> None:
         self.engine.close()

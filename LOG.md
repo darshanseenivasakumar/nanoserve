@@ -188,3 +188,34 @@ one change per measurement, and commit-with-numbers still apply. Judgment calls 
   (4) preemption count and its effect on correctness.
 - Correctness: paged == contiguous token-for-token (fp32 strict; bf16 tie rule); preempted+recomputed
   requests == never-preempted (fp32 strict; bf16 tie rule); no leaked blocks after a run.
+
+## 2026-11-11 — M3 results: paged KV cache
+Correctness (tests: 97 passed at M3 steps 2-3):
+- One mixed batched step, paged vs contiguous: fp32 < 1e-5; **bf16 bitwise identical** (max |diff| 0).
+- Engine paged == contiguous token-for-token (fp32 and bf16), 12 staggered requests.
+- Forced preemption (700-token pool, 8 growing requests): 2 preemptions; fp32 identical; bf16 5/8
+  identical + 3 near-ties (gaps 0.000, 0.125, 0.125 <= 0.25); zero leaked blocks.
+- Multi-token step on an existing context (offset-causal mask) == token-by-token decode (fp32 < 1e-4).
+
+Capacity (bench/runs/m3_capacity.py; same explicit 2 GiB KV budget = 174,762 tokens; 1,500 requests of
+the prompt set with 128 forced output tokens; average request needs 354 tokens):
+| KV cache | peak concurrent requests | KV utilisation (used/reserved) |
+|---|---|---|
+| contiguous (2048-token reservation each) | 85 | 11% |
+| paged (16-token blocks) | **706 (8.3x)** | **97%** |
+Caveat: 706 is the peak while requests are young (prompt + few tokens). When all reach full length the
+pool holds ~494 (= 174,762 / 354), still 5.8x, and preemption keeps it there (1 preemption seen).
+
+Speed (bench/runs/m3_bench.sh; same session; both with the 2 GiB budget; continuous batching):
+| tok/s | c=1 | c=4 | c=8 | c=16 | c=32 | var c=8 | var c=16 |
+|---|---|---|---|---|---|---|---|
+| contiguous | - | 94.2 | 143.0 | 194.5 | 236.0 | 139.3 | 186.0 |
+| paged (gather + SDPA) | 30.3 | 89.5 | 137.5 | 182.6 | 221.0 | 129.1 | 171.6 |
+| TPOT p50 ms contiguous / paged | - / 33.0 | 41.5 / 43.4 | 55.0 / 57.1 | 80.2 / 85.9 | 131.9 / 142.2 | 54.6 / 59.1 | 81.0 / 86.4 |
+=> Paged costs 4-8% throughput here: every step copies each request's scattered blocks into a dense
+tensor before SDPA (one gather per request per layer). That copy is exactly what M4's kernel removes.
+Machine note: c=1 TPOT 33 ms again (the laptop stayed ~20-35% slower than during M1).
+
+DECISION/flag: these M3 runs used the working tree with the M4 kernel code present but attention pinned
+to SDPA ("TEMP during M3 benchmark" line in engine.py), i.e. the M3 code path. A first attempt at this
+benchmark died silently (background job killed when its wsl.exe call returned; nothing recorded).

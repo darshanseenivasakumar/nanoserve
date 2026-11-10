@@ -30,7 +30,9 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
   "gpu: needs a CUDA GPU and downloads the model (deselect with -m 'not gpu')",
+  "spec: speculative decoding tests (1.5B model, ~8 GB RAM); run separately with: pytest -m spec",
 ]
+addopts = "-m 'not spec'"
 
 [build-system]
 requires = ["hatchling"]

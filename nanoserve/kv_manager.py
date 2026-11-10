@@ -16,7 +16,7 @@ import math
 import torch
 
 from nanoserve.kv_cache import BlockTable, ContiguousKVCache, PagedKVCache
-from nanoserve.model import ModelConfig, SeqInput
+from nanoserve.model import DecodeMeta, ModelConfig, SeqInput
 
 
 class ContiguousKVManager:
@@ -71,10 +71,13 @@ class PagedKVManager:
     kind = "paged"
 
     def __init__(self, cfg: ModelConfig, budget_tokens: int, block_size: int = 16, device="cuda",
-                 dtype=torch.bfloat16, watermark: float = 0.01):
+                 dtype=torch.bfloat16, watermark: float = 0.01, attn_backend: str = "sdpa"):
+        """attn_backend: "sdpa" (M3: gather + SDPA per request) or "triton" (M4: one paged-attention
+        kernel launch per layer for all one-token decodes)."""
         self.pool = PagedKVCache.from_token_budget(cfg, budget_tokens, block_size, device, dtype)
         self.block_size = block_size
         self.device = device
+        self.attn_backend = attn_backend
         # Keep a few blocks free at admission so a just-admitted request doesn't trigger an immediate
         # preemption on its first decode step (vLLM does the same).
         self.watermark_blocks = math.floor(watermark * self.pool.num_blocks)
@@ -114,15 +117,32 @@ class PagedKVManager:
     # --- engine interface ---
     def begin_step(self) -> None:
         self._slots = []
+        self._offset = 0                       # start of the next sequence's tokens in the flattened batch
+        self._dec_idx, self._dec_tables, self._dec_lens = [], [], []
 
     def seq_input(self, seq, n_tokens: int) -> SeqInput:
         table = seq.block_table
         self._slots += table.slots(n_tokens)
-        return SeqInput(n_tokens, block_table=torch.tensor(table.blocks, device=self.device),
-                        ctx_len=table.num_tokens)
+        ctx = table.num_tokens
+        use_kernel = self.attn_backend == "triton" and n_tokens == 1 and ctx > 0
+        if use_kernel:
+            self._dec_idx.append(self._offset)
+            self._dec_tables.append(table.blocks)
+            self._dec_lens.append(ctx + 1)
+        self._offset += n_tokens
+        bt = None if use_kernel or ctx == 0 else torch.tensor(table.blocks, device=self.device)
+        return SeqInput(n_tokens, block_table=bt, ctx_len=ctx, use_kernel=use_kernel)
 
     def forward_kwargs(self) -> dict:
-        return {"paged": self.pool, "slot_mapping": torch.tensor(self._slots, device=self.device)}
+        kw = {"paged": self.pool, "slot_mapping": torch.tensor(self._slots, device=self.device)}
+        if self._dec_idx:
+            width = max(len(t) for t in self._dec_tables)
+            tables = [t + [0] * (width - len(t)) for t in self._dec_tables]
+            kw["decode_meta"] = DecodeMeta(
+                token_idx=torch.tensor(self._dec_idx, device=self.device),
+                block_tables=torch.tensor(tables, dtype=torch.int32, device=self.device),
+                context_lens=torch.tensor(self._dec_lens, dtype=torch.int32, device=self.device))
+        return kw
 
     def commit(self, seq, n_tokens: int) -> None:
         seq.block_table.commit(n_tokens)

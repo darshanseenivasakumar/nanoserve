@@ -59,7 +59,7 @@ class LLMEngine:
     def __init__(self, model: Qwen2Model, eos_token_ids: list[int], max_seq_len: int = 2048,
                  policy: str = "continuous", max_num_seqs: int = 8, max_num_batched_tokens: int = 8192,
                  batch_wait_s: float = 0.02, kv_cache: str = "paged", kv_cache_tokens: int | None = None,
-                 block_size: int = 16):
+                 block_size: int = 16, attn_backend: str | None = None):
         """kv_cache: "paged" (M3, default) or "contiguous" (M1/M2). kv_cache_tokens: the explicit KV budget
         in tokens (default 32 x max_seq_len)."""
         self.model = model
@@ -67,8 +67,12 @@ class LLMEngine:
         self._eos = set(self.eos_token_ids)
         self.max_seq_len = max_seq_len
         budget = kv_cache_tokens if kv_cache_tokens is not None else 32 * max_seq_len
+        if attn_backend is None:   # M4 default: the Triton kernel wherever there is a GPU
+            attn_backend = "sdpa"   # TEMP during M3 benchmark; M4 flips this to triton on CUDA
+        self.attn_backend = attn_backend
         if kv_cache == "paged":
-            self.kv = PagedKVManager(model.cfg, budget, block_size, device=model.device, dtype=model.dtype)
+            self.kv = PagedKVManager(model.cfg, budget, block_size, device=model.device, dtype=model.dtype,
+                                     attn_backend=attn_backend)
             # A preempted request re-prefills prompt + outputs (up to max_seq_len tokens) in ONE step.
             max_num_batched_tokens = max(max_num_batched_tokens, max_seq_len)
         elif kv_cache == "contiguous":
@@ -83,6 +87,11 @@ class LLMEngine:
         self._stats = {"steps": 0, "peak_running": 0, "kv_used_tokens_peak": 0, "kv_reserved_tokens_peak": 0,
                       "kv_util_sum": 0.0, "kv_util_samples": 0}
 
+    def reset_stats(self) -> None:
+        for k in self._stats:
+            self._stats[k] = 0.0 if isinstance(self._stats[k], float) else 0
+        self.scheduler.num_preemptions = 0
+
     @property
     def stats(self) -> dict:
         """Counters for the benchmark report: steps, peak running, preemptions, KV utilisation."""
@@ -90,6 +99,7 @@ class LLMEngine:
         s["num_preemptions"] = self.scheduler.num_preemptions
         s["kv_util_mean"] = s["kv_util_sum"] / s["kv_util_samples"] if s["kv_util_samples"] else None
         s["kv_cache"] = self.kv.kind
+        s["attn_backend"] = self.attn_backend
         return s
 
     @classmethod
@@ -187,9 +197,10 @@ class Engine:
     def generate(self, prompt_ids: list[int], max_new_tokens: int, ignore_eos: bool = False) -> Iterator[int]:
         """Yield generated token ids one at a time (greedy). The EOS token, if produced, is yielded too."""
         if self._llm is None:
+            # SDPA on purpose: this single-request path is the reference that must match HF bitwise.
             self._llm = LLMEngine(self.model, self.eos_token_ids, max_seq_len=self.max_seq_len, max_num_seqs=1,
                                   max_num_batched_tokens=self.max_seq_len, batch_wait_s=0.0,
-                                  kv_cache_tokens=self.max_seq_len)
+                                  kv_cache_tokens=self.max_seq_len, attn_backend="sdpa")
         llm = self._llm
         sid = llm.add_request(prompt_ids, max_new_tokens, ignore_eos=ignore_eos)
         try:

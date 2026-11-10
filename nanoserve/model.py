@@ -105,6 +105,15 @@ class SeqInput:
     cache: object | None = None
     block_table: torch.Tensor | None = None
     ctx_len: int = 0
+    use_kernel: bool = False      # M4: this one-token decode is handled by the Triton paged-attention kernel
+
+
+@dataclass
+class DecodeMeta:
+    """M4: built ONCE per step for all kernel-handled decode requests (not once per layer)."""
+    token_idx: torch.Tensor       # [Bd] positions of their tokens in the flattened batch
+    block_tables: torch.Tensor    # [Bd, max_blocks] int32
+    context_lens: torch.Tensor    # [Bd] int32, including this step's token
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -166,7 +175,7 @@ class Qwen2Model:
         return emb.cos().to(self.dtype), emb.sin().to(self.dtype)
 
     def _attention(self, i: int, layer: LayerWeights, h: torch.Tensor, cos, sin,
-                   seqs: list[SeqInput], paged=None, slot_mapping=None) -> torch.Tensor:
+                   seqs: list[SeqInput], paged=None, slot_mapping=None, decode_meta=None) -> torch.Tensor:
         """h: [1, N, hidden] = the flattened tokens of every sequence in this step.
 
         SELECTIVE BATCHING: the Q/K/V/O projections and RoPE are token-wise, so they run ONCE over all N
@@ -184,9 +193,20 @@ class Qwen2Model:
         if paged is not None:
             # Paged (M3): store every token's K/V of this step with ONE indexed copy (slot mapping).
             paged.write(i, k[0], v[0], slot_mapping)
+        o_all = None
+        if decode_meta is not None:
+            # M4: every one-token decode request of this step in ONE Triton launch, reading K/V in place.
+            from nanoserve.kernels.paged_attention import paged_attention_decode
+            o_dec = paged_attention_decode(q[0][decode_meta.token_idx], paged.k[i], paged.v[i],
+                                           decode_meta.block_tables, decode_meta.context_lens, hd ** -0.5)
+            o_all = torch.empty(1, N, q.shape[2] * hd, device=q.device, dtype=q.dtype)
+            o_all[0].index_copy_(0, decode_meta.token_idx, o_dec.reshape(o_dec.shape[0], -1))
         outs, start = [], 0
         for seq in seqs:
             T = seq.n_tokens
+            if seq.use_kernel:
+                start += T
+                continue
             qs = q[:, start:start + T].transpose(1, 2)              # [1, n_heads, T, hd]
             ks = k[:, start:start + T].transpose(1, 2)
             vs = v[:, start:start + T].transpose(1, 2)
@@ -208,7 +228,7 @@ class Qwen2Model:
                 rep = qs.shape[1] // ks.shape[1]
                 ks, vs = ks.repeat_interleave(rep, dim=1), vs.repeat_interleave(rep, dim=1)
                 o = F.scaled_dot_product_attention(qs, ks, vs, attn_mask=mask, scale=hd ** -0.5)
-                outs.append(o.transpose(1, 2).contiguous().reshape(1, T, -1).contiguous())
+                outs.append((start, o.transpose(1, 2).contiguous().reshape(1, T, -1).contiguous()))
                 start += T
                 continue
             # is_causal only for multi-token steps (prefill): token t must not see tokens > t.
@@ -216,19 +236,27 @@ class Qwen2Model:
             # NOTE: SDPA's is_causal assumes queries and keys start at the same position, so a multi-token
             # step on top of a non-empty CONTIGUOUS cache would be WRONG; forward_batch forbids it.
             o = F.scaled_dot_product_attention(qs, ks, vs, is_causal=T > 1, scale=hd ** -0.5, enable_gqa=True)
-            outs.append(o.transpose(1, 2).contiguous().reshape(1, T, -1).contiguous())
+            outs.append((start, o.transpose(1, 2).contiguous().reshape(1, T, -1).contiguous()))
             start += T
-        o = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
+        if o_all is not None:                     # kernel rows already placed; drop in the SDPA rows
+            for s0, o in outs:
+                o_all[:, s0:s0 + o.shape[1]] = o
+            o = o_all
+        else:
+            o = outs[0][1] if len(outs) == 1 else torch.cat([t for _, t in outs], dim=1)
         return F.linear(o, layer.o_w)
 
     @torch.inference_mode()
     def forward_batch(self, token_ids: torch.Tensor, positions: torch.Tensor, seqs: list[SeqInput],
-                      logits: str = "last", paged=None, slot_mapping: torch.Tensor | None = None) -> torch.Tensor:
+                      logits: str = "last", paged=None, slot_mapping: torch.Tensor | None = None,
+                      decode_meta: DecodeMeta | None = None) -> torch.Tensor:
         """One forward pass over several sequences, each either PREFILLING (many tokens, empty cache) or
         DECODING (one token on top of its cache).
 
         token_ids, positions: [N] = all sequences' tokens concatenated, in the order of `seqs`.
-        Returns logits [len(seqs), vocab] for each sequence's LAST token ("last"), or [N, vocab] ("all").
+        Returns logits [len(seqs), vocab] for each sequence's LAST token ("last"), [N, vocab] ("all"), or
+        [R, vocab] for chosen flattened rows when `logits` is an index tensor (M5 verification needs the
+        last k+1 rows of a request, and must not pay the LM head for every prompt row).
         """
         for seq in seqs:
             if seq.cache is not None and seq.n_tokens > 1 and seq.cache.length > 0:
@@ -238,14 +266,17 @@ class Qwen2Model:
         cos, sin = self.rope(positions)
         eps = self.cfg.rms_norm_eps
         for i, layer in enumerate(self.layers):
-            x = x + self._attention(i, layer, rms_norm(x, layer.ln1, eps), cos, sin, seqs, paged, slot_mapping)
+            x = x + self._attention(i, layer, rms_norm(x, layer.ln1, eps), cos, sin, seqs, paged, slot_mapping,
+                                    decode_meta)
             h = rms_norm(x, layer.ln2, eps)
             x = x + F.linear(F.silu(F.linear(h, layer.gate_w)) * F.linear(h, layer.up_w), layer.down_w)
         for seq in seqs:
             if seq.cache is not None:
                 seq.cache.advance(seq.n_tokens)
         x = rms_norm(x, self.norm, eps)
-        if logits == "last":
+        if isinstance(logits, torch.Tensor):
+            x = x[:, logits, :]
+        elif logits == "last":
             # Only score each sequence's next token: a [B, hidden] x [hidden, vocab] matmul, not [N, ...].
             if len(seqs) == 1:
                 x = x[:, -1:, :]

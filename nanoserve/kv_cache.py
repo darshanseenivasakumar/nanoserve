@@ -131,6 +131,11 @@ class BlockTable:
         self.blocks = self.blocks[:keep]
         self.num_tokens = n_tokens
 
+    def rewind(self, n_tokens: int) -> None:
+        """Forget tokens past n_tokens but KEEP the blocks (the speculative engine reserves up front)."""
+        assert n_tokens <= self.num_tokens
+        self.num_tokens = n_tokens
+
     def release(self, allocator: BlockAllocator) -> None:
         allocator.free(self.blocks)
         self.blocks = []

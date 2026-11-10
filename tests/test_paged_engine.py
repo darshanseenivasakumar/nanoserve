@@ -105,9 +105,12 @@ def test_multi_token_step_on_existing_context_equals_token_by_token(ours_fp32_cp
     assert (together - one_by_one).abs().max().item() < 1e-4
 
 
-def engine(model, kv_cache, kv_cache_tokens=16384, max_num_seqs=6):
+def engine(model, kv_cache, kv_cache_tokens=16384, max_num_seqs=6, attn_backend="sdpa"):
+    # attn_backend pinned to SDPA (M4 changed the GPU default to the Triton kernel): these tests are
+    # about PAGING. The kernel has its own tests (test_paged_attention_kernel.py, test_m4_engine.py).
     return LLMEngine(model, load_eos_token_ids(MODEL), max_seq_len=1024, max_num_seqs=max_num_seqs,
-                     batch_wait_s=0.0, kv_cache=kv_cache, kv_cache_tokens=kv_cache_tokens)
+                     batch_wait_s=0.0, kv_cache=kv_cache, kv_cache_tokens=kv_cache_tokens,
+                     attn_backend=attn_backend)
 
 
 def test_fp32_engine_paged_equals_contiguous(ours_fp32_cpu, encode):
