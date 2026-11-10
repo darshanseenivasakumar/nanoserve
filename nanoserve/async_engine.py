@@ -31,6 +31,7 @@ class AsyncEngine:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._start_lock = threading.Lock()
+        self.num_aborted = 0
 
     def _ensure_started(self) -> None:
         with self._start_lock:
@@ -51,15 +52,24 @@ class AsyncEngine:
         self._ensure_started()
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
-        self._inbox.put((list(prompt_ids), max_new_tokens, ignore_eos, loop, q, time.perf_counter()))
-        while True:
-            item = await q.get()
-            if isinstance(item, BaseException):
-                raise item
-            token, t, finished = item
-            yield token, t
-            if finished:
-                return
+        handle = {"seq_id": None, "done": False}       # the engine thread fills in seq_id
+        self._inbox.put(("add", list(prompt_ids), max_new_tokens, ignore_eos, loop, q, time.perf_counter(), handle))
+        try:
+            while True:
+                item = await q.get()
+                if isinstance(item, BaseException):
+                    handle["done"] = True
+                    raise item
+                token, t, finished = item
+                if finished:
+                    handle["done"] = True
+                yield token, t
+                if finished:
+                    return
+        finally:
+            if not handle["done"]:
+                # The caller stopped listening (e.g. HTTP client disconnected): stop generating and free KV.
+                self._inbox.put(("abort", handle))
 
     # ---- engine thread -------------------------------------------------------------------------------
     @staticmethod
@@ -70,12 +80,20 @@ class AsyncEngine:
             pass  # the caller's loop has closed; nobody is listening any more
 
     def _admit(self, item) -> None:
-        prompt, max_new, ignore_eos, loop, q, t_arrival = item
+        if item[0] == "abort":
+            sid = item[1]["seq_id"]
+            if sid is not None and sid in self._streams:
+                self.engine.abort(sid)
+                del self._streams[sid]
+                self.num_aborted += 1
+            return
+        _, prompt, max_new, ignore_eos, loop, q, t_arrival, handle = item
         try:
             sid = self.engine.add_request(prompt, max_new, ignore_eos=ignore_eos, arrival_time=t_arrival)
         except Exception as e:
             self._send(loop, q, e)
             return
+        handle["seq_id"] = sid
         self._streams[sid] = (loop, q)
 
     def _run(self) -> None:
