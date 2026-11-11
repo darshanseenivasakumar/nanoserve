@@ -98,7 +98,7 @@ What failed: nothing in M1 itself. (Fixed beforehand: repetition_penalty comment
 ## 2026-11-10 — M2 in progress: environment drift found before benchmarking
 - Synchronous LLMEngine.step() timing (200-token prompts, decode): B=1 35.4 ms, B=2 40.3, B=4 48.7,
   B=8 63.2 ms/step (28 / 50 / 82 / 127 tok/s).
-- B=1 looked like a regression vs M1 (24.4 ms TPOT), so ran an A/B in one session: M1 code (f8aa4b1)
+- B=1 looked like a regression vs M1 (24.4 ms TPOT), so ran an A/B in one session: M1 code (ca96dd8)
   now 34-38 ms, M2 code 35-41 ms. => NOT the refactor: the machine got slower since the M1 benchmark.
 - Likely cause: Windows background load 28% CPU (Epic Games Launcher + EOS overlay renderer, Opera),
   power plan "Balanced". Our decode is CPU/launch-bound, so it tracks CPU availability directly.
@@ -640,7 +640,7 @@ different accumulation order than three). The bitwise-vs-HF tests still pass on 
   CPU reference models are never merged. Also from_pretrained now converts dtype tensor by tensor; this
   did NOT measurably change the peak (11.06 GB) and is kept only because it is harmless.
 - FLAG (pre-existing): the speculative test session peaks at ~11.5 GB RSS on the pre-M10 code too
-  (measured in a worktree at bc438bb), i.e. right at the 11 GB WSL cap. Raising `memory=` in
+  (measured in a worktree at 84600ea), i.e. right at the 11 GB WSL cap. Raising `memory=` in
   C:\Users\Lenovo\.wslconfig would remove the risk (a Windows setting: the user's call).
 
 Probe (bench/runs/m10_step_probe.py; same weights + pool, interleaved, median of 3 x 20):
