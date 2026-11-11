@@ -22,8 +22,14 @@ Cache bookkeeping (both models use the paged pool; blocks are reserved up front 
   * the draft may lag by one extra token (when all k drafts are accepted it never saw d_k or the bonus);
     its next round starts with a multi-token "catch-up" step (masked attention on an existing context).
 
+M7b, CUDA graphs (default on GPU): every decode-like forward is replayed as a graph. The trick for
+multi-token steps (verification, and the draft's 2-token catch-up): split each new token into its OWN
+decode row that shares the request's block table, with context lengths ctx+1, ctx+2, ... . The paged
+decode kernel then applies causality by itself (row j sees keys 0..ctx+j), so a verification of k+1
+tokens is one ordinary decode step with k+1 rows -- graph-safe. Prefills of new requests stay eager.
+
 Shortcuts (flagged): blocks for prompt + max_new + k + 1 are reserved at admission (no preemption here);
-attention uses the gather+SDPA path for both models (not the M4 kernel); fixed k (no adaptive lookahead).
+fixed k (no adaptive lookahead); without graphs (CPU / cuda_graphs=False) attention uses gather+SDPA.
 """
 from __future__ import annotations
 
@@ -59,7 +65,7 @@ class SpeculativeEngine:
     def __init__(self, target: Qwen2Model, draft: Qwen2Model, eos_token_ids: list[int],
                  num_speculative_tokens: int = 4, max_seq_len: int = 2048, max_num_seqs: int = 8,
                  max_num_batched_tokens: int = 4096, target_kv_tokens: int | None = None,
-                 draft_kv_tokens: int | None = None, block_size: int = 16):
+                 draft_kv_tokens: int | None = None, block_size: int = 16, cuda_graphs: bool | None = None):
         if target.cfg.vocab_size != draft.cfg.vocab_size:
             raise ValueError("draft and target must share a vocabulary")
         self.target, self.draft = target, draft
@@ -74,6 +80,14 @@ class SpeculativeEngine:
         d_tokens = draft_kv_tokens or t_tokens
         self.tpool = PagedKVCache.from_token_budget(target.cfg, t_tokens, block_size, target.device, target.dtype)
         self.dpool = PagedKVCache.from_token_budget(draft.cfg, d_tokens, block_size, draft.device, draft.dtype)
+        if cuda_graphs is None:
+            cuda_graphs = target.device.type == "cuda"
+        self.t_graph = self.d_graph = None
+        if cuda_graphs:
+            from nanoserve.cuda_graphs import DecodeGraphRunner
+            span = max_seq_len + self.k + 1
+            self.t_graph = DecodeGraphRunner(target, self.tpool, span)
+            self.d_graph = DecodeGraphRunner(draft, self.dpool, span)
         self.waiting: deque[SpecSeq] = deque()
         self.running: list[SpecSeq] = []
         self.sequences: dict[int, SpecSeq] = {}
@@ -83,7 +97,8 @@ class SpeculativeEngine:
     # ---- bookkeeping -----------------------------------------------------------------------------------
     def reset_stats(self) -> None:
         self._stats = {"steps": 0, "target_forwards": 0, "draft_forwards": 0, "proposed": 0, "accepted": 0,
-                       "emitted_by_verification": 0, "peak_running": 0}
+                       "emitted_by_verification": 0, "peak_running": 0, "graph_draft_steps": 0,
+                       "graph_verify_steps": 0}
 
     @property
     def stats(self) -> dict:
@@ -92,6 +107,7 @@ class SpeculativeEngine:
         s["tokens_per_target_forward"] = (s["emitted_by_verification"] / s["target_forwards"]
                                           if s["target_forwards"] else None)
         s["num_speculative_tokens"] = self.k
+        s["cuda_graphs"] = self.t_graph is not None
         return s
 
     def _reserve_tokens(self, seq: SpecSeq) -> int:
@@ -170,6 +186,38 @@ class SpeculativeEngine:
             table.commit(len(toks))
         return logits
 
+    def _rows(self, runner, items) -> torch.Tensor | None:
+        """Graph path for decode-like steps. items: list of (table, new_tokens). Every new token becomes its
+        own row (shared block table, context length ctx + j + 1), so multi-token steps are causal via the
+        kernel's per-row context length. Returns logits for ALL rows, or None if too many rows for a graph."""
+        tokens, positions, slots, tables, lens = [], [], [], [], []
+        for table, toks in items:
+            ctx = table.num_tokens
+            tokens += toks
+            positions += range(ctx, ctx + len(toks))
+            slots += table.slots(len(toks))
+            tables += [table.blocks] * len(toks)
+            lens += range(ctx + 1, ctx + len(toks) + 1)
+        if runner is None or len(tokens) > runner.max_bucket:
+            return None
+        logits = runner.run(tokens, positions, slots, tables, lens)
+        for table, toks in items:
+            table.commit(len(toks))
+        return logits
+
+    def _decode_like(self, model, pool, runner, items, last_n, graph_stat):
+        """Run decode-like items through the graph if possible, else eagerly. Returns logits for the last
+        `last_n` new tokens of every item, concatenated in order."""
+        logits = self._rows(runner, items)
+        if logits is None:
+            return self._forward(model, pool, [(t, toks, last_n) for t, toks in items])
+        self._stats[graph_stat] += 1
+        keep, off = [], 0
+        for _, toks in items:
+            off += len(toks)
+            keep += range(off - last_n, off)
+        return logits[torch.tensor(keep, device=logits.device)]
+
     # ---- one engine step ---------------------------------------------------------------------------------
     def step(self) -> list[StepOutput]:
         admitted = self._admit()
@@ -183,26 +231,35 @@ class SpeculativeEngine:
         # 1) DRAFT. Prefill new requests; for running ones, catch up on unseen tokens and propose d1,
         #    then k-1 more one-token steps.
         drafts: dict[SpecSeq, list[int]] = {s: [] for s in decoding}
-        items = [(s.d_table, s.prompt_ids, 0) for s in admitted]
-        items += [(s.d_table, s.tokens[s.d_table.num_tokens:], 1) for s in decoding]
-        if items:
-            logits = self._forward(self.draft, self.dpool, items)
+        if admitted:                                  # prefills: eager
+            self._forward(self.draft, self.dpool, [(s.d_table, s.prompt_ids, 0) for s in admitted])
+            st["draft_forwards"] += 1
+        if decoding:
+            logits = self._decode_like(self.draft, self.dpool, self.d_graph,
+                                       [(s.d_table, s.tokens[s.d_table.num_tokens:]) for s in decoding], 1,
+                                       "graph_draft_steps")
             st["draft_forwards"] += 1
             for s, tok in zip(decoding, logits.argmax(-1).tolist()):
                 drafts[s].append(tok)
         for _ in range(self.k - 1):
             if not decoding:
                 break
-            logits = self._forward(self.draft, self.dpool, [(s.d_table, [drafts[s][-1]], 1) for s in decoding])
+            logits = self._decode_like(self.draft, self.dpool, self.d_graph,
+                                       [(s.d_table, [drafts[s][-1]]) for s in decoding], 1, "graph_draft_steps")
             st["draft_forwards"] += 1
             for s, tok in zip(decoding, logits.argmax(-1).tolist()):
                 drafts[s].append(tok)
 
         # 2) TARGET. Prefill new requests (1 row: their first token); verify running ones: feed
         #    [newest token, d1..dk] and read the target's greedy choice at all k+1 positions.
-        items = [(s.t_table, s.prompt_ids, 1) for s in admitted]
-        items += [(s.t_table, s.tokens[s.t_table.num_tokens:] + drafts[s], self.k + 1) for s in decoding]
-        choices = self._forward(self.target, self.tpool, items).argmax(-1).tolist()
+        choices = []
+        if admitted:                                  # prefills: eager, 1 row each (their first token)
+            choices += self._forward(self.target, self.tpool,
+                                     [(s.t_table, s.prompt_ids, 1) for s in admitted]).argmax(-1).tolist()
+        if decoding:
+            items = [(s.t_table, s.tokens[s.t_table.num_tokens:] + drafts[s]) for s in decoding]
+            choices += self._decode_like(self.target, self.tpool, self.t_graph, items, self.k + 1,
+                                         "graph_verify_steps").argmax(-1).tolist()
         st["target_forwards"] += 1
 
         # 3) ACCEPT and emit.

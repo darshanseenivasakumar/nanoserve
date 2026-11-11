@@ -38,9 +38,9 @@ def target_bf16_gpu():
     return Qwen2Model.from_pretrained(TARGET, device="cuda", dtype=torch.bfloat16)
 
 
-def spec_run(target, draft, encode, prompts, k=4, max_num_seqs=1):
+def spec_run(target, draft, encode, prompts, k=4, max_num_seqs=1, cuda_graphs=None):
     eng = SpeculativeEngine(target, draft, load_eos_token_ids(MODEL), num_speculative_tokens=k,
-                            max_seq_len=1024, max_num_seqs=max_num_seqs)
+                            max_seq_len=1024, max_num_seqs=max_num_seqs, cuda_graphs=cuda_graphs)
     ids = {eng.add_request(encode(pick_prompts([p])[0]), MAX_NEW): i for i, p in enumerate(prompts)}
     outs = {i: [] for i in range(len(prompts))}
     while eng.has_unfinished():
@@ -61,6 +61,25 @@ def test_self_speculation_accepts_almost_everything(ours_fp32_cpu, encode):
     assert out == plain_greedy(ours_fp32_cpu, encode, PROMPTS[:2])
 
 
+def test_fp32_gpu_graphed_self_speculation_is_identical(encode):
+    # M7b strict gate for the GRAPHED path: draft steps and verification rows replayed as CUDA graphs
+    # (Triton kernel, fp32 IEEE) must still give exactly plain greedy. Loaded here and freed after, so the
+    # 2 GB fp32 copy is not resident together with the 1.5B bf16 model used by later tests.
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    m = Qwen2Model.from_pretrained(MODEL, device="cuda", dtype=torch.float32)
+    try:
+        out, st = spec_run(m, m, encode, PROMPTS[:2], cuda_graphs=True)
+        print(f"graphed self-spec fp32: acceptance {st['acceptance_rate']:.3f}, draft graph steps "
+              f"{st['graph_draft_steps']}, verify graph steps {st['graph_verify_steps']}")
+        assert st["graph_draft_steps"] > 0 and st["graph_verify_steps"] > 0
+        assert st["acceptance_rate"] >= 0.95
+        assert out == plain_greedy(m, encode, PROMPTS[:2])
+    finally:
+        del m
+        torch.cuda.empty_cache()
+
+
 def test_fp32_spec_equals_plain_greedy_target(target_fp32_cpu, ours_fp32_cpu, encode):
     out, st = spec_run(target_fp32_cpu, ours_fp32_cpu, encode, PROMPTS)
     print(f"0.5B->1.5B fp32 acceptance {st['acceptance_rate']:.3f}, "
@@ -75,10 +94,14 @@ def test_fp32_batched_spec_equals_one_at_a_time(target_fp32_cpu, ours_fp32_cpu, 
     assert batched == single
 
 
-def test_bf16_spec_matches_plain_greedy_up_to_ties(target_bf16_gpu, ours_bf16_gpu, encode):
-    out, st = spec_run(target_bf16_gpu, ours_bf16_gpu, encode, PROMPTS)
+@pytest.mark.parametrize("graphs", [False, True])
+def test_bf16_spec_matches_plain_greedy_up_to_ties(graphs, target_bf16_gpu, ours_bf16_gpu, encode):
+    out, st = spec_run(target_bf16_gpu, ours_bf16_gpu, encode, PROMPTS, cuda_graphs=graphs)
     ref = plain_greedy(target_bf16_gpu, encode, PROMPTS)
-    print(f"bf16 acceptance {st['acceptance_rate']:.3f}; identical {sum(a == b for a, b in zip(out, ref))}/{len(ref)}")
+    print(f"bf16 graphs={graphs} acceptance {st['acceptance_rate']:.3f}; "
+          f"identical {sum(a == b for a, b in zip(out, ref))}/{len(ref)}")
+    if graphs:
+        assert st["graph_draft_steps"] > 0 and st["graph_verify_steps"] > 0
     for i, (a, b) in enumerate(zip(out, ref)):
         if a == b:
             continue
