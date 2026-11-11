@@ -22,16 +22,25 @@ RESULTS = Path(__file__).with_name("results")
 COLORS = {"vllm": "#1f77b4", "llamacpp": "#2ca02c", "llamacpp-np8": "#98df8a", "hf-generate": "#7f7f7f"}
 
 
-def load(tag: str) -> dict:
-    data = defaultdict(dict)   # engine -> concurrency -> result
-    for f in glob.glob(str(RESULTS / f"*_{tag}.json")):
-        d = json.load(open(f))
-        data[d["backend"]["engine"]][d["concurrency"]] = d
+def load(tags: list[str]) -> dict:
+    """Merge result files of several tags. The first tag that has an engine owns its plain name; the same
+    engine from a later tag is labelled "engine [tag]" (e.g. nanoserve before/after a change)."""
+    data = defaultdict(dict)   # engine label -> concurrency -> result
+    owner = {}
+    for tag in tags:
+        for f in glob.glob(str(RESULTS / f"*_{tag}.json")):
+            d = json.load(open(f))
+            eng = d["backend"]["engine"]
+            owner.setdefault(eng, tag)
+            label = eng if owner[eng] == tag else f"{eng} [{tag}]"
+            data[label][d["concurrency"]] = d
     return data
 
 
 def color(engine: str) -> str:
-    return COLORS.get(engine, "#d62728" if engine.startswith("nanoserve") else "#9467bd")
+    if engine.startswith("nanoserve"):
+        return "#ff9896" if "[" in engine else "#d62728"
+    return COLORS.get(engine.split(" [")[0], "#9467bd")
 
 
 def panel(ax, data, metric, title, ylabel, logy=False):
@@ -56,8 +65,9 @@ def panel(ax, data, metric, title, ylabel, logy=False):
     ax.legend(fontsize=8)
 
 
-def plot(tag: str, out: Path, label: str) -> Path | None:
-    data = load(tag)
+def plot(tags: list[str], out: Path, label: str) -> Path | None:
+    data = load(tags)
+    tag = tags[0]
     if not data:
         return None
     fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
@@ -76,12 +86,13 @@ def plot(tag: str, out: Path, label: str) -> Path | None:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--tag", default="m6")
+    p.add_argument("--tag", default="m6", help="comma-separated; first tag wins per engine, e.g. m7,m6")
     p.add_argument("--out", default=str(Path(__file__).with_name("plots")))
     args = p.parse_args()
-    for tag, label in ((args.tag, "fixed 128 output tokens"), (f"{args.tag}-var16-256", "output 16-256 tokens")):
-        path = plot(tag, Path(args.out), label)
-        print(path or f"no results for tag {tag}")
+    tags = args.tag.split(",")
+    for tg, label in ((tags, "fixed 128 output tokens"), ([t + "-var16-256" for t in tags], "output 16-256 tokens")):
+        path = plot(tg, Path(args.out), label)
+        print(path or f"no results for tags {tg}")
 
 
 if __name__ == "__main__":

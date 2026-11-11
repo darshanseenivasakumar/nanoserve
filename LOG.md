@@ -331,3 +331,38 @@ Findings:
 - openai_http: engine names like "llamacpp-np8" now map to the llamacpp fairness flags (prefix match).
 
 Where we lose and why: README.md, "Where we lose, and why".
+
+## 2026-11-11 — M7: CUDA-graph decode steps (user: "Yes, add CUDA graphs")
+Plan: record each PURE-decode step (every request one token, Triton kernel path) as a CUDA graph per
+batch-size bucket (1,2,4,8,16,24,32,48,64,96,128), captured lazily, shared memory pool. Inputs in static
+device buffers overwritten before replay; batches between buckets padded; padding rows write/read only a
+reserved "garbage" KV block. Steps with any prefill stay eager. On by default with paged + triton.
+
+Correctness (tests/test_cuda_graphs.py, 5 passed; full suite 117 passed):
+- graph step vs eager step at an exact bucket size (B=4): BITWISE equal (max |diff| 0).
+- padded batch (3 real rows in the 4-graph): within the tie rule.
+- engine with graphs vs without, 12 staggered requests: 12/12 token-identical (33 graph / 8 eager steps).
+- padding only touched the garbage block; only it stays allocated after a run.
+
+Synchronous step probe (bench/runs/m7_step_probe.py; same process, interleaved A/B):
+| batch | eager ms/step | graphs ms/step | speedup |
+|---|---|---|---|
+| 1 | 33.9 | 9.8 | 3.48x |
+| 8 | 33.8 | 10.6 | 3.19x |
+| 32 | 32.9 | 12.3 | 2.67x |
+
+Benchmark (bench/runs/m7_bench.sh; same session; Windows load checked: Steam open but idle, no measurable CPU):
+In-process A/B (paged, triton, 2 GiB): tok/s c=1/8/32 eager 29.2 / 224.7 / 802.0 -> graphs 88.5 / 558.7 /
+1517.1 (3.0x / 2.5x / 1.9x). TPOT p50 33.6/33.9/35.5 -> 11.0/12.9/16.0 ms.
+HTTP server with graphs (same client as M6):
+  fixed tok/s c=1/4/8/16/32: 94.5 / 314.1 / 553.8 / 943.4 / 1440.4 (TPOT p50 10.3 / 12.1 / 13.2 / 14.2 / 17.4 ms)
+  varied 16-256 c=4/8/16/32: 304.1 / 504.3 / 830.2 / 1116.6 (TTFT p50 54 / 59 / 77 / 113 ms)
+vLLM same-session control c=1/8/32: 121.1 / 798.5 / 2175.9 (M6: 121.1 / 802.4 / 2208.1, within 2%).
+=> nanoserve = 78% / 69% / 66% of vLLM (c=1/8/32), 65-70% on varied lengths (vs 23-30% in M6).
+=> now beats llama.cpp's best measured config at c=8 (554 vs 486 fixed; 504 vs 392 varied).
+Remaining gaps: TTFT under load (prefill eager, per-request SDPA, no chunked prefill: p50 606 vs 335 ms at
+c=32); per-step Python work outside the graph (batch building, H2D copies, argmax + tolist, GIL); no op
+fusion. Speculative engine does not use graphs (not re-measured).
+Plots: `python -m bench.plot --tag m7,m6` (plot.py now merges tags; nanoserve M6 shown as "nanoserve [m6]").
+Process note: /tmp in WSL was cleared by a WSL restart mid-session; patch scripts now live in the session
+scratchpad.

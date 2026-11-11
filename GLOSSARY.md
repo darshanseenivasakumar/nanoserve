@@ -193,6 +193,19 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
 - **finish_reason**: why a completion ended: "stop" (EOS) or "length" (max_tokens).
 - **Client disconnect / abort**: when the client goes away mid-stream, stop generating and free its KV.
 
+## CUDA graphs (M7)
+- **Graph capture / replay**: run a sequence of GPU work once while CUDA records it ("capture"); later
+  re-launch the whole recording with one call ("replay"). Kills per-kernel launch overhead.
+- **Static buffers**: a graph remembers memory ADDRESSES, so inputs must be written into the same tensors
+  every time (we `copy_` new tokens/positions/slots/block tables into them before each replay).
+- **Batch-size bucket**: graphs have fixed shapes, so we keep one per batch size (1, 2, 4, 8, ...); a batch
+  of 5 uses the 8-graph.
+- **Padding rows / garbage block**: the 3 extra rows of that 8-graph must do harmless work; they write and
+  read a KV block reserved for nobody.
+- **Lazy capture**: record a bucket's graph the first time it's needed instead of all at startup.
+- **Graph memory pool**: memory the graphs' intermediate tensors live in; shared by all buckets because
+  only one graph replays at a time.
+
 ## Tooling
 - **uv**: a fast Python package/project manager. `uv sync` installs exactly what `pyproject.toml`/`uv.lock` say.
 - **venv (virtual environment)**: an isolated folder of Python packages. vLLM gets its own because it pins a
