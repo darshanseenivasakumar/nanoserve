@@ -425,3 +425,40 @@ M8a: budget sweep, no code change (bench/runs/m8a_budget_sweep.sh; in-process, s
 - FAILED/FLAG: the "1024" run silently ran at 2048 -- LLMEngine raises the paged budget to max_seq_len
   (2048) because, without chunked prefill, a preempted request must re-prefill prompt + outputs in one
   step. That floor is the concrete reason to build chunked prefill (M8b).
+
+M8b: chunked prefill (code). One rule per request per step: feed tokens[num_cached : num_cached + chunk];
+sample only when the chunk reaches the end of the known tokens. Budget order: running decodes (1 each),
+then running partial prefills, then FCFS admissions taking min(remaining, budget). KV for the whole prompt
+is reserved at admission (memory unchanged; compute spread over steps). Default on for the paged cache.
+Tests (6 new; 123 total passed): fp32 budget 64 (31 partial chunks) token-identical to unchunked; bf16
+9/12 + 3 ties (<= 0.125); chunking + preemption exact in fp32, no leaked blocks.
+
+Sweep with chunking (bench/runs/m8b_chunked_sweep.sh; in-process; same session):
+| budget | fixed c=8 TTFT p50/p99 | fixed c=32 TTFT p50/p99 | c=32 tok/s | var c=32 TTFT p50/p99 | var c=32 TPOT p50/p99 |
+|---|---|---|---|---|---|
+| 8192 | 167 / 223 | 578 / 670 | 1629.6 | 102 / 552 | 18.1 / 21.9 |
+| **2048** | 162 / 226 | **334** / 562 | **1659.5** | 101 / 566 | 18.8 / 26.5 |
+| 1024 | 119 / 207 | 277 / 602 | 1639.4 | 108 / 601 | 19.2 / 29.2 |
+| 512 | 122 / 249 | 324 / 1062 | 1397.6 | 153 / 855 | 22.6 / 35.8 |
+- 1024-2048 is the sweet spot: TTFT p50 roughly halves at c=32 with no throughput loss. 512 is too small
+  (too many steps: -14% tok/s, p99 x2).
+- SURPRISE: smaller budgets make our TPOT p99 WORSE (21.9 -> 35.8 ms), the opposite of vLLM's docs.
+  Cause: any step containing a prefill chunk runs EAGERLY (~35 ms base) instead of as a graph (~13 ms);
+  smaller chunks put more decode tokens into eager steps. vLLM uses "piecewise" CUDA graphs (attention
+  outside the graph) so mixed steps stay fast. Next lever, not built.
+- DECISION: default budget 2048 for engine, server and harness (vLLM's API-server default on < 70 GB
+  GPUs; best balance here). 1024 is the TTFT-optimised option.
+
+M8 final (bench/runs/m8_final.sh; HTTP server, same client as M6/M7, same session with a vLLM control):
+| fixed 128 | c=1 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|---|
+| tok/s M7 server (budget 8192) | 94.5 | 314.1 | 553.8 | 943.4 | 1440.4 |
+| tok/s M8 server (chunked, 2048) | 94.8 | 314.9 | 554.1 | 947.8 | 1452.8 |
+| TTFT p50/p99 ms M7 | 36/64 | 96/183 | 155/221 | 341/405 | 606/739 |
+| TTFT p50/p99 ms M8 | 36/64 | 85/188 | 173/231 | **246/355** | **354/667** |
+| TPOT p50 ms M7 / M8 | 10.3 / 10.2 | 12.1 / 12.1 | 13.2 / 13.2 | 14.2 / 14.7 | 17.4 / 19.2 |
+Varied 16-256 M8: 299.5 / 498.2 / 825.2 / 1120.2 tok/s (c=4..32), TTFT p50 53 / 59 / 75 / 110 ms.
+vLLM control: 121.3 / 801.1 / 2197.4 tok/s (c=1/8/32), TTFT p50/p99 c=32 314/494 ms, TPOT p50 c=32 12.0 ms.
+=> TTFT p50 at c=32: 606 -> 354 ms (-42%); gap to vLLM 1.8x -> 1.13x. Throughput unchanged (66-78% of
+vLLM). c=8 TTFT slightly worse (155 -> 173 ms; an 8-prompt burst fits one step either way, so this is
+noise-level). TPOT p50 at c=32 +1.8 ms (more mixed eager steps). Plots: `python -m bench.plot --tag m8,m6`.

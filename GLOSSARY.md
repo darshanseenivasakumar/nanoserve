@@ -106,8 +106,10 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
   short requests waste most of their reservation.
 - **Internal fragmentation**: memory reserved by someone but not used by them, so no one else can use it
   either. The contiguous cache's main flaw; the paged cache (M3) fixes it.
-- **Chunked prefill**: processing a long prompt in pieces on top of an already-filled cache. Not supported
-  in M1 (needs a causal mask offset by the cached length).
+- **Chunked prefill**: processing a long prompt in pieces across several steps, each piece attending over
+  the already-cached part. Built in M8: each step feeds tokens[num_cached : num_cached + chunk] and samples
+  only when the chunk reaches the end. Lets a burst of prompts share steps with decodes, and lets prompts be
+  longer than the per-step token budget.
 - **Bitwise equal**: two results identical down to the last bit, not just "close". Achieved in M1 by
   performing floating-point operations in exactly HF's order.
 - **Roofline (bound)**: the best speed physics allows: here, weight bytes / memory bandwidth for decode.
@@ -205,6 +207,17 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
 - **Lazy capture**: record a bucket's graph the first time it's needed instead of all at startup.
 - **Graph memory pool**: memory the graphs' intermediate tensors live in; shared by all buckets because
   only one graph replays at a time.
+
+## Time to first token (M8)
+- **Synchronised burst**: in a closed-loop benchmark with equal output lengths, requests finish together and
+  their replacements arrive together, so the server sees bursts of prefills.
+- **Queue wait vs service time**: TTFT = time waiting to be scheduled + time of the step that produces the
+  first token. Profiling showed ours was ~0 + ~600 ms: the step, not the queue.
+- **Step token budget (max_num_batched_tokens)**: max tokens processed per step. Larger = fewer, longer steps
+  (better throughput, worse TTFT for early requests); smaller = the reverse. vLLM's API-server default on
+  GPUs below 70 GB is 2048.
+- **Piecewise CUDA graphs**: graphing everything in a step EXCEPT attention (whose shapes vary with prefills),
+  so mixed prefill+decode steps stay fast. vLLM does this; nanoserve doesn't (its mixed steps run eagerly).
 
 ## Tooling
 - **uv**: a fast Python package/project manager. `uv sync` installs exactly what `pyproject.toml`/`uv.lock` say.

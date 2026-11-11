@@ -13,9 +13,9 @@ speculative decoding). Everything is parameterised (`--model`, `--device`, KV bu
 
 Qwen2.5-0.5B-Instruct, bf16 (llama.cpp: f16 GGUF), 64 prompts, greedy, 3 repeats (median; plots show
 min-max), every engine through the same OpenAI streaming client, all fairness checks passed (exact output
-lengths, identical prompt token counts). "nanoserve (M7)" = final engine with CUDA-graph decode, measured
-with a same-session vLLM control (121.1 / 798.5 / 2175.9 tok/s at c=1/8/32, within 2% of the M6 vLLM run).
-Other rows are from the M6 session.
+lengths, identical prompt token counts). **"nanoserve M8" = the final engine**: CUDA-graph decode + chunked
+prefill with a 2048-token step budget, measured with a same-session vLLM control (121.3 / 801.1 / 2197.4
+tok/s at c=1/8/32, within 1% of the M6 vLLM run). Other rows are from the M6 / M7 sessions.
 
 **Fixed 128 output tokens — output tokens/s**
 
@@ -23,28 +23,37 @@ Other rows are from the M6 session.
 |---|---|---|---|---|---|
 | HF `generate` (static padded batching, in-process) | 26.9 | 87.9 | 173.0 | – | – |
 | nanoserve M6 (no CUDA graphs) | 27.8 | 107.8 | 208.4 | 379.9 | 652.1 |
-| **nanoserve M7 (CUDA graphs)** | **94.5** | **314.1** | **553.8** | **943.4** | **1440.4** |
+| nanoserve M7 (CUDA graphs) | 94.5 | 314.1 | 553.8 | 943.4 | 1440.4 |
+| **nanoserve M8 (graphs + chunked prefill)** | **94.8** | **314.9** | **554.1** | **947.8** | **1452.8** |
 | llama.cpp b12247, 8 slots | 105.1 | 193.8 | 485.6 | – | – |
 | llama.cpp b12247, 32 slots | 104.7 | 176.4 | 214.3 | 332.0 | 611.7 |
 | vLLM 0.33.0 | 121.1 | 436.3 | 802.4 | 1405.2 | 2208.1 |
-| nanoserve M7 / vLLM | 78% | 72% | 69% | 67% | 65% |
+| nanoserve M8 / vLLM | 78% | 72% | 69% | 67% | 66% |
+
+**Time to first token under load (fixed 128 tokens) — p50 / p99**
+
+| engine | c=8 | c=16 | c=32 |
+|---|---|---|---|
+| nanoserve M7 (one big prefill step) | 155 / 221 ms | 341 / 405 ms | 606 / 739 ms |
+| **nanoserve M8 (chunked, 2048/step)** | 173 / 231 ms | **246 / 355 ms** | **354 / 667 ms** |
+| vLLM 0.33.0 | 125 / 167 ms | 198 / 311 ms | 314 / 494 ms |
 
 **Varied output lengths (16–256 per request, seeded) — the realistic case**
 
 | engine | c=4 | c=8 | c=16 | c=32 | TTFT p50 / p99 @ c=16 |
 |---|---|---|---|---|---|
 | nanoserve M6 | 106.5 | 192.5 | 343.1 | 478.8 | 101 / 304 ms |
-| **nanoserve M7 (CUDA graphs)** | **304.1** | **504.3** | **830.2** | **1116.6** | 77 / 293 ms |
+| **nanoserve M8** | **299.5** | **498.2** | **825.2** | **1120.2** | 75 / 314 ms |
 | llama.cpp, 8 slots | 170.4 | 391.9 | – | – | – |
 | llama.cpp, 32 slots | 115.6 | 129.3 | 177.9 | 330.0 | 220 / 585 ms |
 | vLLM 0.33.0 | 433.5 | 761.1 | 1282.8 | 1722.1 | 56 / 229 ms |
 
-![fixed-length results](bench/plots/m7.png)
-![varied-length results](bench/plots/m7-var16-256.png)
+![fixed-length results](bench/plots/m8.png)
+![varied-length results](bench/plots/m8-var16-256.png)
 
-**In one line:** nanoserve reaches **65–78% of vLLM's throughput** on a 6 GB laptop GPU, beats HF
-`generate` at every load and llama.cpp's best configuration from c=8 up; time per token is 10–17 ms vs
-vLLM's 8–12 ms. The biggest remaining gap is **time to first token under load** (prefill, below).
+**In one line:** on a 6 GB laptop GPU nanoserve reaches **66–78% of vLLM's throughput** and is within
+**~13% of vLLM's median time to first token** at 32 concurrent requests; it beats HF `generate` at every load
+and llama.cpp's best configuration from c=8 up. Time per token is 10–19 ms vs vLLM's 8–12 ms.
 
 ## Architecture
 
@@ -86,6 +95,7 @@ vLLM's 8–12 ms. The biggest remaining gap is **time to first token under load*
 | M6 | OpenAI-compatible streaming server + full benchmark | 23–30% of vLLM; gap = a constant ~4x per-step cost (launch overhead) |
 | M7 | CUDA-graph decode steps (one graph per batch bucket, static buffers, padding into a garbage block) | graph step **bitwise** = eager step; decode step **34 → 10 ms**; **65–78% of vLLM** |
 | M7b | Graphs for speculative decoding: draft steps + verification as "one decode row per token" | speculative now **1.21x faster** at c=1 (k=2), was 0.71x; cost model predicted within ~4% |
+| M8 | TTFT: profile, then chunked prefill + 2048-token step budget | TTFT under load was one giant synchronised prefill step; p50 at c=32 **606 → 354 ms** (vLLM 314), same throughput |
 
 Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every term: [`GLOSSARY.md`](GLOSSARY.md).
 
@@ -101,7 +111,7 @@ Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every t
   gap <= 0.25, about one bf16 rounding step at these magnitudes); anything else fails.
 - **Kernel**: Triton output vs a PyTorch oracle: fp32 <= 1e-5, bf16 <= 1e-2 (measured <= 4.5e-3), for
   the head layouts of 0.5B, 1.5B and 3B.
-- 124 tests (`uv run pytest`: 117, plus `uv run pytest -m spec`: 7 speculative tests on the 1.5B model).
+- 130 tests (`uv run pytest`: 123, plus `uv run pytest -m spec`: 7 speculative tests on the 1.5B model).
 
 ## Where we lose, and why (honest section)
 
@@ -111,31 +121,38 @@ Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every t
    with one launch: synchronous decode step **33.9 → 9.8 ms** (B=1), 33.8 → 10.6 (B=8), 32.9 → 12.3 (B=32);
    end to end 2.0–3.4x more throughput. Memory-bandwidth floor for 0.5B on this GPU: ~6 ms/step (estimate:
    ~0.99 GB of weights / ~168 GB/s, bandwidth not measured).
-2. **What is left of the per-token gap (10–17 ms vs vLLM's 8–12 ms).** Per step we still build the batch in
+2. **What is left of the per-token gap (10–19 ms vs vLLM's 8–12 ms).** Per step we still build the batch in
    Python (scheduler, slot lists, block tables), copy inputs to the GPU, and argmax + `.tolist()` outside the
    graph; ops are not fused (vLLM uses torch.compile on top of its graphs); and the engine thread shares the
-   GIL with the HTTP/tokenizer thread (vLLM v1 runs API server and engine core as separate processes). TPOT
-   also grows a little with load (10 → 17 ms from c=1 to c=32; vLLM 8 → 12 ms).
-3. **Time to first token under load — now the largest gap.** Prefills are not graphed and run one request at
-   a time through SDPA, and there is no chunked prefill: TTFT p50 at c=32 is 606 ms vs vLLM's 335 ms, and a
-   long prompt joining the batch stalls everyone's next token for that step.
-4. **Speculative decoding: a modest, low-load win — and only after graphs.** It is lossless (output identical
+   GIL with the HTTP/tokenizer thread (vLLM v1 runs API server and engine core as separate processes).
+3. **Mixed steps run without graphs — the biggest remaining lever.** Any step that contains a prefill chunk
+   runs eagerly (~35 ms base instead of ~13 ms). That is why TPOT grows with load (10 → 19 ms from c=1 to
+   c=32) and why, unlike in vLLM, a SMALLER step budget makes our TPOT p99 worse (21.9 → 35.8 ms from 8192 to
+   512 tokens/step): more decode tokens land in eager steps. vLLM keeps mixed steps fast with "piecewise"
+   CUDA graphs (everything except attention is graphed). Not built.
+4. **Time to first token: mostly closed (M8).** Profiling showed TTFT under load was ~100% one giant prefill
+   step: 32 synchronised arrivals (~7k prompt tokens) prefilled at once, everyone waiting for all of it
+   (queue wait 0 ms). Chunked prefill with a 2048-token budget (vLLM's own default on GPUs < 70 GB) spreads it
+   over several steps: TTFT p50 at c=32 **606 → 354 ms** (vLLM 314) with no throughput loss. p99 barely
+   moves (667 vs vLLM 494): the last requests of a burst still wait for the burst's total prefill compute,
+   which is ~100% GPU-bound (GEMM 70%, unfused elementwise ops 23% of prefill GPU time).
+5. **Speculative decoding: a modest, low-load win — and only after graphs.** It is lossless (output identical
    to the target). Without graphs it LOST (0.71x at k=4): the 0.5B draft cost 0.86x the 1.5B target because
    both were launch-bound. With graphs (draft 9.5 ms vs target 24.7 ms; verifying 5 tokens costs 1.07x one)
    it wins **1.21x at k=2, c=1** (TPOT 24.6 → 20.1 ms), 1.12x at k=4; at c=4 it is break-even (1.07x / 0.96x)
    because batching already shares the target's cost. A cost model predicted each number within ~4%
    (`bench/runs/m7b_costs.py`). Acceptance is only 53–67% for this draft/target pair, which caps the gain.
-5. **llama.cpp depends on its configuration.** Its 8-slot config was 2.3x faster than nanoserve M6 at c=8;
+6. **llama.cpp depends on its configuration.** Its 8-slot config was 2.3x faster than nanoserve M6 at c=8;
    nanoserve M7 now beats it there (554 vs 486 tok/s; varied 504 vs 392). Its per-token cost drops when the
    slot count matches the load; ours needs no tuning.
-6. **Not implemented:** graphs for prefill, op fusion (torch.compile), chunked prefill, prefix caching,
+7. **Not implemented:** piecewise graphs for mixed/prefill steps, op fusion (torch.compile), prefix caching,
    swap-to-CPU preemption, sampling (greedy only), quantization, tensor parallelism, split-K decode for long
    contexts. Speculative engine: reserves KV for prompt + max_new up front (no preemption), fixed k (no
    adaptive lookahead), eager prefills.
-7. **CUDA-graph caveats.** One graph per bucket (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128), captured lazily on
+8. **CUDA-graph caveats.** One graph per bucket (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128), captured lazily on
    first use (a one-off pause of ~1 s); batches between buckets are padded (5 requests run the 8-graph);
    batches above 128 or any step containing a prefill run eagerly.
-8. **Measurement caveats.** Laptop GPU shared with the Windows display; background Windows load moved our
+9. **Measurement caveats.** Laptop GPU shared with the Windows display; background Windows load moved our
    TPOT by up to 40% during development (24 → 35 ms), so every comparison above was re-measured in one
    session (controls in `LOG.md`). The NVIDIA Windows driver spills over-budget CUDA allocations into system
    RAM instead of failing, so capacity was measured against explicit KV budgets. llama.cpp runs f16 weights,
@@ -151,12 +168,14 @@ Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every t
 - CUDA graphs: decode step **33.9 → 9.8 ms** at batch 1 (≈1,000 launches → 1 replay); nanoserve 23–30% → 65–78% of vLLM.
 - Speculative decoding pays only if k × draft + verify < tokens accepted × target step: with graphs
   2 × 9.5 + 26.1 = 45 ms buys 2.28 tokens vs 24.7 ms for one → **1.21x** measured (1.25x predicted).
+- TTFT under a burst = queue wait (0 ms here) + the admitting step; one 7k-token prefill step ≈ 600 ms on
+  this GPU. Splitting it into 2048-token steps halves the median: **606 → 354 ms** at c=32.
 
 ## Reproduce
 
 ```bash
 uv sync
-uv run pytest                      # 117 tests (GPU + model download)
+uv run pytest                      # 123 tests (GPU + model download)
 uv run pytest -m spec              # 7 speculative-decoding tests (1.5B model, ~8 GB RAM)
 
 # in-process engine
@@ -170,7 +189,7 @@ uv run python -m bench.harness --backend openai --engine-name nanoserve --base-u
 bash bench/servers/vllm.sh                       # vLLM in its own venv (~/envs/vllm)
 bash bench/servers/build_llamacpp.sh && bash bench/servers/llamacpp.sh
 
-bash bench/runs/m6_bench.sh && uv run python -m bench.plot --tag m6
+bash bench/runs/m8_final.sh && uv run python -m bench.plot --tag m8,m6
 ```
 
 ## Running on a cloud GPU (the 3B benchmark)
