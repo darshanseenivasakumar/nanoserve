@@ -76,6 +76,13 @@ def _validate(body: dict) -> tuple[int, bool, SamplingParams | None]:
     return max_tokens, bool(body.get("ignore_eos", False)), sampling
 
 
+def _doc_body(example: dict) -> dict:
+    """Describe the JSON body in the OpenAPI schema, so the /docs page (Swagger UI) shows an editable body with
+    this example. Documentation only: the handlers still read and validate the raw JSON themselves."""
+    return {"requestBody": {"required": True, "content": {"application/json": {
+        "schema": {"type": "object", "additionalProperties": True}, "example": example}}}}
+
+
 def create_app(engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI:
     app = FastAPI(title="nanoserve")
     eos = set(engine.eos_token_ids)
@@ -141,7 +148,8 @@ def create_app(engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI:
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
-    @app.post("/v1/completions")
+    @app.post("/v1/completions", openapi_extra=_doc_body(
+        {"prompt": "The capital of France is", "max_tokens": 16, "temperature": 0}))
     async def completions(request: Request):
         body = await request.json()
         max_tokens, ignore_eos, sampling = _validate(body)
@@ -160,7 +168,9 @@ def create_app(engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI:
         except ValueError as e:
             raise HTTPException(400, str(e))
 
-    @app.post("/v1/chat/completions")
+    @app.post("/v1/chat/completions", openapi_extra=_doc_body(
+        {"messages": [{"role": "user", "content": "Tell me a joke"}], "max_tokens": 60, "temperature": 0.8,
+         "seed": 1}))
     async def chat_completions(request: Request):
         body = await request.json()
         max_tokens, ignore_eos, sampling = _validate(body)
