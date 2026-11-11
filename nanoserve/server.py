@@ -65,7 +65,7 @@ def _validate(body: dict) -> tuple[int, bool]:
 
 def create_app(engine: AsyncEngine, tokenizer, model_name: str) -> FastAPI:
     app = FastAPI(title="nanoserve")
-    eos = set(engine.engine.eos_token_ids)
+    eos = set(engine.eos_token_ids)
 
     @app.get("/health")
     async def health():
@@ -171,8 +171,8 @@ def main(argv=None) -> None:
     import uvicorn
     from transformers import AutoTokenizer
 
-    from nanoserve.engine import LLMEngine, load_eos_token_ids
-    from nanoserve.model import Qwen2Model
+    from nanoserve.engine_process import EngineProcess, EngineSpec, build_engine
+    from nanoserve.model import ModelConfig
 
     p = argparse.ArgumentParser(description="nanoserve OpenAI-compatible server")
     p.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
@@ -190,29 +190,32 @@ def main(argv=None) -> None:
                    help="unfused PyTorch ops instead of M10's fused Triton kernels")
     p.add_argument("--draft-model", default=None, help="enable speculative decoding with this draft model")
     p.add_argument("--num-speculative-tokens", type=int, default=4)
+    p.add_argument("--engine-in-thread", action="store_true",
+                   help="run the engine as a thread of this process (M6-M10) instead of its own process (M11)")
     args = p.parse_args(argv)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    target = Qwen2Model.from_pretrained(args.model, device="cuda", dtype=torch.bfloat16)
-    kv_tokens = int(args.kv_cache_gb * 2**30) // target.cfg.kv_bytes_per_token(torch.bfloat16)
-    eos = load_eos_token_ids(args.model)
-    if args.draft_model:
-        from nanoserve.speculative import SpeculativeEngine
-        draft = Qwen2Model.from_pretrained(args.draft_model, device="cuda", dtype=torch.bfloat16)
-        llm = SpeculativeEngine(target, draft, eos, num_speculative_tokens=args.num_speculative_tokens,
-                                max_seq_len=args.max_seq_len, max_num_seqs=args.max_num_seqs,
-                                max_num_batched_tokens=args.max_num_batched_tokens, target_kv_tokens=kv_tokens)
+    kv_tokens = int(args.kv_cache_gb * 2**30) // ModelConfig.from_pretrained(args.model).kv_bytes_per_token(torch.bfloat16)
+    spec = EngineSpec(model=args.model, max_seq_len=args.max_seq_len, max_num_seqs=args.max_num_seqs,
+                      max_num_batched_tokens=args.max_num_batched_tokens, kv_cache_tokens=kv_tokens,
+                      attn_backend=args.attn_backend, cuda_graphs=False if args.no_cuda_graphs else None,
+                      piecewise_graphs=False if (args.no_cuda_graphs or args.no_piecewise_graphs) else None,
+                      fused_ops=False if args.no_fused_ops else None, draft_model=args.draft_model,
+                      num_speculative_tokens=args.num_speculative_tokens)
+    # Graphs are captured before accepting traffic (vLLM does the same), so no request pays for one.
+    if args.engine_in_thread:
+        llm = build_engine(spec)
+        if hasattr(llm, "capture_graphs"):
+            print(f"captured CUDA graphs in {llm.capture_graphs():.1f} s", flush=True)
+        engine = AsyncEngine(llm)
     else:
-        llm = LLMEngine(target, eos, max_seq_len=args.max_seq_len, max_num_seqs=args.max_num_seqs,
-                        max_num_batched_tokens=args.max_num_batched_tokens, kv_cache="paged",
-                        kv_cache_tokens=kv_tokens, attn_backend=args.attn_backend,
-                        cuda_graphs=False if args.no_cuda_graphs else None,
-                        piecewise_graphs=False if (args.no_cuda_graphs or args.no_piecewise_graphs) else None,
-                        fused_ops=False if args.no_fused_ops else None)
-        # Capture every graph before accepting traffic (vLLM does the same), so no request pays for one.
-        print(f"captured CUDA graphs in {llm.capture_graphs():.1f} s", flush=True)
-    app = create_app(AsyncEngine(llm), tokenizer, args.model)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+        engine = EngineProcess(spec)        # M11: engine loop in its own process (own GIL)
+        print(f"engine process ready; captured CUDA graphs in {engine.capture_s:.1f} s", flush=True)
+    app = create_app(engine, tokenizer, args.model)
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    finally:
+        engine.close()
 
 
 if __name__ == "__main__":

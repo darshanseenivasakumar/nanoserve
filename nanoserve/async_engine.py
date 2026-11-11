@@ -33,6 +33,10 @@ class AsyncEngine:
         self._start_lock = threading.Lock()
         self.num_aborted = 0
 
+    @property
+    def eos_token_ids(self) -> list[int]:
+        return self.engine.eos_token_ids
+
     def _ensure_started(self) -> None:
         with self._start_lock:
             if self._thread is None or not self._thread.is_alive():

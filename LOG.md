@@ -679,3 +679,68 @@ p50 -1.4..-3.0 ms. nanoserve = 78-89% of vLLM (was 69-79% in M9).
 - Fixed c=32 ITL p99: off 154 ms (one unfused 2048-token prefill step ~166 ms) -> on 71 ms (vLLM 97).
 - The "off" rows reproduce M9's numbers within 1-3% (e.g. c=32 1523 vs 1548), so this session was not
   unusually fast or slow.
+
+## 2026-11-11 — M11: the engine in its own process (user: "Yes, next phase" = "profile the high-load step loop and overlap CPU scheduling with GPU work")
+Profile first (bench/runs/m11_loop_profile.py; new optional per-phase timer in LLMEngine.step, off unless
+engine.timing = {}; c=32, fixed 128, benchmark prompts):
+| loop | tok/s | wall/step | GPU busy span | schedule | prepare | launch | wait for GPU | post | outside step() |
+|---|---|---|---|---|---|---|---|---|---|
+| A) bare engine.step() loop | 2150.5 | 14.88 ms | 14.19 (95%) | 0.06 | 0.09 | 4.66 | 9.93 | 0.10 | 0.03 |
+| B) AsyncEngine + asyncio clients | 1979.1 | 16.09 ms | 14.10 (88%) | 0.07 | 0.10 | 4.77 | 9.82 | 0.10 | 1.23 |
+- My hypothesis was WRONG: scheduling + input building + post-processing is 0.25 ms of a 14.9 ms step and
+  the GPU is busy 95% of the bare loop. Overlapping scheduling with GPU work could gain <= 5%.
+- The loss is ABOVE the engine. Same session, c=32 (bench/runs/m11_layers.sh): bare loop 2150, in-process
+  harness (AsyncEngine thread) 1928, HTTP server 1681 tok/s (-22% vs bare; vLLM 2275 in the M10 session).
+  In one process the engine thread and the HTTP/asyncio thread share Python's GIL: when the GPU finishes a
+  step, the engine thread must get the GIL back while the other thread formats SSE chunks / detokenizes;
+  the GPU idles meanwhile (B's 1.23 ms "outside step()" per step, and more with HTTP).
+- DECISION (plan pivot, same goal): instead of async scheduling, move the engine loop into its own process
+  (vLLM v1's API-server / engine-core split): own GIL, the GPU loop never waits on HTTP work.
+
+M11 code: nanoserve/engine_process.py. EngineSpec (picklable) + build_engine (shared with the in-thread
+mode); child started with "spawn" (CUDA can't be used after fork); two one-way pipes: ("add" | "abort" |
+"stats" | "stop") in, ("tokens", t, [(rid, token, finished)]) out = ONE message per step; an API-side
+reader thread dispatches with ONE call_soon_threadsafe per event loop per step (AsyncEngine did one per
+token). Exceptions are pickled across (fallback RuntimeError). Child stamps tokens with perf_counter
+(CLOCK_MONOTONIC on Linux = one clock for all processes). Server default = engine process;
+--engine-in-thread gives the M6-M10 behaviour. AsyncEngine gained an eos_token_ids property so the server
+accepts either object.
+Tests (8 new): tokens BITWISE identical to the in-thread engine (one request at a time, EOS stopping on);
+requests batch together; timestamps increase and lie on this process's clock; callers from several event
+loops; a rejected request raises ValueError in the caller; disconnect aborts the request and frees its KV
+IN THE CHILD (checked through a stats round trip); the HTTP server runs on top; close() stops the child.
+
+Quick A/B, c=32 fixed, same session (m11_layers.sh twice):
+| server engine | tok/s | TTFT p50/p99 | TPOT p50/p99 |
+|---|---|---|---|
+| thread (M10) | 1676.8 | 260/518 | 16.8/17.7 |
+| **own process (M11)** | **2019.9** | **233/553** | **13.3/15.3** |
+| (in-process harness, thread) | 1911.2 / 1950.0 | | |
+=> +20.5% from the split alone; the server is now within 6% of the bare engine loop (2150) and faster
+than the in-process harness, which still pays the thread + GIL cost itself.
+Tests: 152 default + 7 spec passed.
+
+M11 server A/B (bench/runs/m11_bench.sh; engine in a thread = the M10 server, then in its own process;
+vLLM control at every concurrency and both workloads; one session; 0 problems):
+| fixed 128 | c=1 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|---|
+| tok/s thread / **process** | 110.1 / **113.6** | 372.0 / **407.4** | 660.2 / **746.3** | 1125.8 / **1334.7** | 1742.5 / **2110.1** |
+| gain | +3.2% | +9.5% | +13.0% | +18.6% | +21.1% |
+| vLLM tok/s | 124.4 | 447.7 | 819.4 | 1437.2 | 2275.9 |
+| process / vLLM | 91% | 91% | 91% | 93% | 93% |
+| TTFT p50/p99 thread | 22/49 | 55/135 | 107/144 | 195/264 | 296/449 |
+| TTFT p50/p99 process | 21/49 | 32/103 | 81/143 | 174/280 | 273/511 |
+| TTFT p50/p99 vLLM | 28/57 | 55/141 | 122/168 | 223/282 | 330/541 |
+| TPOT p50 thread / process / vLLM | 9.0/8.7/7.9 | 10.4/9.5/8.5 | 11.5/10.0/9.0 | 12.9/10.6/9.5 | 16.3/12.7/11.4 |
+| varied 16-256 | | c=4 | c=8 | c=16 | c=32 |
+| tok/s thread / **process** | | 370.6 / **401.2** | 621.5 / **705.9** | 978.5 / **1204.4** | 1366.6 / **1674.6** |
+| vLLM tok/s | | 449.1 | 781.0 | 1316.4 | 1778.3 |
+| process / vLLM | | 89% | 90% | 91% | 94% |
+| TTFT p50 thread / process / vLLM | | 30/29/43 | 35/31/47 | 50/42/64 | 95/81/124 |
+| TPOT p50 thread / process / vLLM | | 10.7/9.7/8.6 | 11.8/10.3/9.1 | 14.4/11.5/10.4 | 17.2/13.8/12.9 |
+=> The gain grows with load (+3% at c=1 -> +21% at c=32; varied +8% -> +23%), as GIL contention would:
+more tokens/s = more HTTP work competing with the engine thread. nanoserve = 89-94% of vLLM (was 78-89%).
+Median TTFT below vLLM's at every load measured; p99 TTFT below vLLM's everywhere except varied c=8 (138
+vs 137 ms, equal within noise) -- cause of our lower TTFT still not investigated (flagged since M10).
+- The "thread" rows reproduce M10's server within 1-2% (c=32 1742 vs 1769): a normal session.
+- Remaining per-token gap ~10% (TPOT p50 8.7 vs 7.9 at c=1, 12.7 vs 11.4 at c=32).

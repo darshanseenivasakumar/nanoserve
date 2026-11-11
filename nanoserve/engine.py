@@ -181,10 +181,13 @@ class LLMEngine:
             self.scheduler.abort(seq)
 
     def step(self) -> list[StepOutput]:
+        if self.timing is not None:
+            self.timing["_step_start"] = time.perf_counter()
         plan = self.scheduler.schedule(now=time.perf_counter())   # admits (allocating KV) and may preempt
         if not plan.scheduled:
             self.last_step = None
             return []
+        self._mark("schedule")
         m = self.model
         self.kv.begin_step()
         tokens, positions, inputs, counts = [], [], [], []
@@ -197,6 +200,7 @@ class LLMEngine:
         n_prefill = sum(seq.is_prefill for seq in plan.scheduled)
         self.last_step = StepStats(n_prefill=n_prefill, n_decode=len(plan.scheduled) - n_prefill,
                                    n_tokens=len(tokens))
+        self._mark("prepare", gpu_start=True)
 
         runner = self.graph_runner
         if (runner is not None and n_prefill == 0 and len(inputs) <= runner.max_bucket
@@ -213,7 +217,9 @@ class LLMEngine:
         else:
             logits = m.forward_batch(torch.tensor(tokens, device=m.device), torch.tensor(positions, device=m.device),
                                      inputs, logits="last", **self.kv.forward_kwargs())
+        self._mark("launch", gpu_end=True)
         next_tokens = logits.argmax(-1).tolist()      # greedy; one sync for the whole batch
+        self._mark("wait")
 
         for seq, n in zip(plan.scheduled, counts):
             self.kv.commit(seq, n)
@@ -232,7 +238,35 @@ class LLMEngine:
                 self.scheduler.finish(seq)             # frees its KV
                 del self.sequences[seq.seq_id]
             outputs.append(StepOutput(seq.seq_id, tok, finished))
+        self._mark("post")
         return outputs
+
+    # ---- M11: optional per-phase timing (off unless `engine.timing = {}`) ----------------------------------
+    timing: dict | None = None
+
+    def _mark(self, phase: str, gpu_start: bool = False, gpu_end: bool = False) -> None:
+        """Add the CPU time since the previous mark to `phase`. With gpu_start/gpu_end, also record CUDA
+        events around the forward pass; their elapsed time (GPU busy span) is summed into "gpu" once the
+        step has synchronised. Costs nothing when timing is off."""
+        T = self.timing
+        if T is None:
+            return
+        now = time.perf_counter()
+        last = T.get("_last")
+        if last is not None and phase != "schedule":
+            T[phase] = T.get(phase, 0.0) + now - last
+        elif phase == "schedule" and "_step_start" in T:
+            T[phase] = T.get(phase, 0.0) + now - T["_step_start"]
+        T["_last"] = now
+        if gpu_start:
+            T["_ev0"] = torch.cuda.Event(enable_timing=True)
+            T["_ev0"].record()
+        if gpu_end:
+            T["_ev1"] = torch.cuda.Event(enable_timing=True)
+            T["_ev1"].record()
+        if phase == "post":
+            T["gpu"] = T.get("gpu", 0.0) + T["_ev0"].elapsed_time(T["_ev1"]) / 1e3
+            T["steps"] = T.get("steps", 0) + 1
 
     def _record_stats(self, running: list[Sequence]) -> None:
         st = self._stats

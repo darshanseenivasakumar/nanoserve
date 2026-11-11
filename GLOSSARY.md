@@ -259,6 +259,24 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
 - **Lazy initialisation**: building something only when first needed (M10 merges weights only for the fused
   path), which here also kept peak memory from doubling.
 
+## Processes and the GIL (M11)
+- **GIL (global interpreter lock)**: in CPython only one thread runs Python code at a time. Two threads in
+  one process take turns; a thread that wants to run waits until the other releases the lock (it does when
+  it blocks on I/O, a GPU sync, or after a short switch interval).
+- **Thread vs process**: threads share one process's memory AND its GIL; processes have separate memory and
+  separate GILs, so their Python code really runs at the same time. The price: data between processes
+  must be copied (pickled) through a pipe or shared memory.
+- **IPC (inter-process communication)**: how processes talk; here two one-way pipes carrying pickled
+  messages. One message per engine step (not one per token) keeps its cost small.
+- **API server / engine core split**: vLLM v1's architecture, built here in M11: the HTTP + tokenizer process
+  and the GPU loop process. HTTP work can no longer delay the next GPU step.
+- **spawn vs fork**: two ways to start a child process. fork copies the parent (fast) but a CUDA context
+  can't be used in a forked child; spawn starts a fresh interpreter and imports the code again.
+- **Monotonic clock**: a clock that never jumps backwards (CLOCK_MONOTONIC). On Linux time.perf_counter()
+  uses it, so timestamps taken in two processes are directly comparable.
+- **Profile disproves hypothesis**: M11 planned to overlap scheduling with GPU work; the profile showed
+  scheduling cost 0.25 ms of a 14.9 ms step, and the real loss was GIL sharing with the HTTP thread.
+
 ## Tooling
 - **uv**: a fast Python package/project manager. `uv sync` installs exactly what `pyproject.toml`/`uv.lock` say.
 - **venv (virtual environment)**: an isolated folder of Python packages. vLLM gets its own because it pins a
