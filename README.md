@@ -321,7 +321,7 @@ Nothing is hard-coded to the laptop. On a rented Linux GPU with >= 24 GB (L4, A1
 the CUDA toolkit, cmake and uv installed:
 
 ```bash
-git clone <this repo> ~/nanoserve && cd ~/nanoserve
+git clone https://github.com/darshanseenivasakumar/nanoserve.git ~/nanoserve && cd ~/nanoserve
 CUDA_ARCH=89 bash bench/runs/cloud_3b.sh        # 89 = L4/4090, 80 = A100, 90 = H100
 ```
 It runs the kernel tests on that GPU, installs vLLM, builds llama.cpp, downloads the 3B fp16 GGUF (two

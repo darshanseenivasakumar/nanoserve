@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # M14: the 3B benchmark on a rented Linux GPU, in one command (NOT run yet: needs a cloud GPU).
 #
-#   git clone <this repo> ~/nanoserve && cd ~/nanoserve && bash bench/runs/cloud_3b.sh
+#   git clone https://github.com/darshanseenivasakumar/nanoserve.git ~/nanoserve && cd ~/nanoserve && bash bench/runs/cloud_3b.sh
 #
 # Assumes: Ubuntu, an NVIDIA GPU with >= 24 GB (L4 / A10 / 4090 / A100 / H100), the CUDA toolkit (nvcc),
 # cmake, git, curl, and uv. Set CUDA_ARCH for llama.cpp (89 = L4/4090, 80 = A100, 90 = H100).
