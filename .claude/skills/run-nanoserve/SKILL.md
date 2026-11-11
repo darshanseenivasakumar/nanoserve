@@ -62,6 +62,15 @@ kill "$(ss -ltnp | grep ':8002 ' | grep -oP 'pid=\K[0-9]+' | head -1)"
 
 (`client.py` is stdlib-only, so plain `python3` works; it never starts or stops anything.)
 
+`KEEP=1` keeps the server only for the rest of the SAME shell: when a Windows `wsl.exe ...` call returns,
+WSL kills the processes it started. For a server that stays up (e.g. to open it in a browser), keep the
+call itself running as a long-lived/background command; `--host 0.0.0.0` lets Windows reach it, and
+`http://localhost:8002/docs` then opens the interactive API page (Swagger UI) from Windows:
+
+```bash
+wsl.exe -d Ubuntu -- bash -lc 'cd ~/nanoserve && exec uv run python -m nanoserve.server --host 0.0.0.0 --port 8002 --kv-cache-gb 1'
+```
+
 **Engine in-process** (for edits to `engine.py`, `scheduler.py`, `kv_*.py`, `model.py`, `sampling.py`,
 `cuda_graphs.py`, `kernels/`): builds the engine exactly like the server (`engine_process.build_engine`),
 batches 3 requests (2 greedy, 1 seeded sample), prints answers and step counters. Stack traces land in your
@@ -121,6 +130,9 @@ uv run pytest -m spec -q    # 8 passed (~4 min): 1.5B model, speculative decodin
   copies of the 1.5B model on the GPU (seen when two test modules each loaded one). Load one at a time.
 - **`python3: can't open file '/patch_....py'`**: a `$VAR` path came through `wsl.exe ... bash -lc '...'`
   empty. Use a script file (see Gotchas).
+- **`KEEP=1` said "server left running", but later `curl localhost:8002/health` returns nothing, from
+  Windows AND inside WSL**: the server died when the `wsl.exe` call that launched it returned (it looked
+  like a Windows-to-WSL networking problem; it wasn't). Start it as a long-lived command (Run section).
 - **`port 8002 is busy (pid N); stop it or set PORT`**: something already listens there. Kill that PID or
   run with `PORT=8003`.
 - **`WARN: child N still alive 15 s after the server; killing it`**: the engine process did not shut down
