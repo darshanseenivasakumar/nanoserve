@@ -238,6 +238,27 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
 - **Capture at startup**: capturing ~1,000 pieces takes seconds, so the server does it before accepting
   traffic (vLLM does too); otherwise the first request of each new size would pay for it.
 
+## Operator fusion (M10)
+- **Kernel fusion / operator fusion**: doing several small operations in ONE GPU kernel, so the data is read
+  from memory once and written once, instead of each operation writing its result to memory for the next
+  one to read back. Analogy: one trip to the fridge for all ingredients instead of one trip per ingredient.
+- **Memory-bound vs compute-bound**: a kernel is memory-bound when moving the bytes takes longer than the
+  math (RMSNorm, SiLU, RoPE, adds: almost no math per byte); compute-bound when the math dominates (big
+  matmuls). Fusing memory-bound ops saves time in proportion to the bytes it avoids moving.
+- **Per-kernel fixed cost**: even an empty kernel costs a few microseconds on the GPU (start-up, a gap per
+  graph node). At decode, ~830 tiny kernels x ~2 us mattered more than their bytes.
+- **Merged GEMM**: stacking weight matrices that read the same input ([q;k;v], [gate;up]) so one matmul
+  replaces three or two. Same math, but cuBLAS may pick a different accumulation order -> tiny bf16
+  differences (why fused and unfused outputs differ at ties).
+- **Rounding point**: where a result is rounded to bf16. PyTorch rounds after every bf16 op; a fused kernel
+  that wants identical results must round at the same points, not just once at the end.
+- **FMA (fused multiply-add)**: one instruction computing a*b + c with a single rounding. Compilers may
+  "contract" a separate multiply and add into an FMA; that skips the intermediate rounding and changes
+  results. M10's RoPE kernel lost its intermediate roundings in compilation (exact cause not pinned down)
+  until they were written as integer bit operations.
+- **Lazy initialisation**: building something only when first needed (M10 merges weights only for the fused
+  path), which here also kept peak memory from doubling.
+
 ## Tooling
 - **uv**: a fast Python package/project manager. `uv sync` installs exactly what `pyproject.toml`/`uv.lock` say.
 - **venv (virtual environment)**: an isolated folder of Python packages. vLLM gets its own because it pins a

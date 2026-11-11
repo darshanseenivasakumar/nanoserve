@@ -60,10 +60,10 @@ class LLMEngine:
                  policy: str = "continuous", max_num_seqs: int = 8, max_num_batched_tokens: int = 2048,
                  batch_wait_s: float = 0.02, kv_cache: str = "paged", kv_cache_tokens: int | None = None,
                  block_size: int = 16, attn_backend: str | None = None, cuda_graphs: bool | None = None,
-                 chunked_prefill: bool | None = None, piecewise_graphs: bool | None = None):
+                 chunked_prefill: bool | None = None, piecewise_graphs: bool | None = None,
+                 fused_ops: bool | None = None):
         """kv_cache: "paged" (M3, default) or "contiguous" (M1/M2). kv_cache_tokens: the explicit KV budget
         in tokens (default 32 x max_seq_len)."""
-        self.model = model
         self.eos_token_ids = list(eos_token_ids)
         self._eos = set(self.eos_token_ids)
         self.max_seq_len = max_seq_len
@@ -71,6 +71,14 @@ class LLMEngine:
         if attn_backend is None:   # M4 default: the Triton kernel wherever there is a GPU
             attn_backend = "triton" if (kv_cache == "paged" and model.device.type == "cuda") else "sdpa"
         self.attn_backend = attn_backend
+        # M10: fused Triton kernels for the token-wise ops; part of the same fast-path bundle as the kernel.
+        if fused_ops is None:
+            fused_ops = attn_backend == "triton"
+        if fused_ops:
+            if model.device.type != "cuda":
+                raise ValueError("fused ops are Triton kernels: they need a GPU")
+            model = model.with_fused_ops()
+        self.model = model
         if kv_cache == "paged":
             self.kv = PagedKVManager(model.cfg, budget, block_size, device=model.device, dtype=model.dtype,
                                      attn_backend=attn_backend)
@@ -129,6 +137,7 @@ class LLMEngine:
         s["cuda_graphs"] = self.graph_runner is not None
         s["graph_buckets"] = self.graph_runner.captured_buckets if self.graph_runner else []
         s["piecewise_graphs"] = self.piecewise_runner is not None
+        s["fused_ops"] = self.model.fused
         s["piecewise_buckets"] = self.piecewise_runner.captured_buckets if self.piecewise_runner else []
         return s
 

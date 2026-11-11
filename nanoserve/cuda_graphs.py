@@ -23,7 +23,7 @@ import math
 import torch
 
 from nanoserve.kv_cache import PagedKVCache
-from nanoserve.model import DecodeMeta, Qwen2Model, SeqInput, rms_norm
+from nanoserve.model import DecodeMeta, Qwen2Model, SeqInput
 
 BUCKETS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
 
@@ -201,7 +201,7 @@ class PiecewiseGraphRunner:
             self.v[:, :B].copy_(v)
             self.x[:, :B].copy_(x)
         else:
-            self.x[:, :B].copy_(rms_norm(x, m.norm, m.cfg.rms_norm_eps))
+            self.x[:, :B].copy_(m.final_norm(x))
 
     def _capture(self, B: int) -> None:
         # Warm-up writes K/V through self.slots: point every row at the garbage block first, or stale slots

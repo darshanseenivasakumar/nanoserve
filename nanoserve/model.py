@@ -14,6 +14,7 @@ bf16 results can match HF bit-for-bit. Change the math here and the token-for-to
 """
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +78,11 @@ class LayerWeights:
     gate_w: torch.Tensor
     up_w: torch.Tensor
     down_w: torch.Tensor
+    # M10: merged matrices (one GEMM instead of three / two), built by merge(). After it, q_w, k_w, v_w (and
+    # biases) and gate_w, up_w above are row VIEWS into these: nothing stored twice, unfused path unchanged.
+    qkv_w: torch.Tensor | None = None
+    qkv_b: torch.Tensor | None = None
+    gate_up_w: torch.Tensor | None = None
 
     HF_NAMES = {
         "ln1": "input_layernorm.weight",
@@ -91,6 +97,21 @@ class LayerWeights:
     @classmethod
     def from_state_dict(cls, sd: dict, i: int) -> "LayerWeights":
         return cls(**{field: sd[f"model.layers.{i}.{hf}"] for field, hf in cls.HF_NAMES.items()})
+
+    def merge(self) -> None:
+        """Build the merged matrices and turn the per-matrix fields into views of them. Lazy (only the fused
+        path needs it) and one layer at a time: when nothing else holds the originals they are freed as each
+        field is replaced, so loading never holds two copies of the weights. (M10 first merged eagerly at
+        load time: +50% peak memory, which crashed WSL when the 1.5B fp32 test model loaded.)"""
+        if self.qkv_w is not None:
+            return
+        nq, nk, ng = self.q_w.shape[0], self.k_w.shape[0], self.gate_w.shape[0]
+        self.qkv_w = torch.cat([self.q_w, self.k_w, self.v_w])
+        self.q_w, self.k_w, self.v_w = self.qkv_w[:nq], self.qkv_w[nq:nq + nk], self.qkv_w[nq + nk:]
+        self.qkv_b = torch.cat([self.q_b, self.k_b, self.v_b])
+        self.q_b, self.k_b, self.v_b = self.qkv_b[:nq], self.qkv_b[nq:nq + nk], self.qkv_b[nq + nk:]
+        self.gate_up_w = torch.cat([self.gate_w, self.up_w])
+        self.gate_w, self.up_w = self.gate_up_w[:ng], self.gate_up_w[ng:]
 
 
 @dataclass
@@ -133,6 +154,8 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 class Qwen2Model:
     """Weights + forward. No nn.Module: nothing is trained, and plain tensors keep the data flow visible."""
 
+    fused = False      # M10: True on the view returned by with_fused_ops()
+
     def __init__(self, cfg: ModelConfig, state_dict: dict[str, torch.Tensor]):
         self.cfg = cfg
         self.embed = state_dict["model.embed_tokens.weight"]
@@ -151,11 +174,30 @@ class Qwen2Model:
         from safetensors.torch import load_file
         folder = _snapshot(name)
         cfg = ModelConfig.from_pretrained(str(folder))
-        sd: dict[str, torch.Tensor] = {}
+        raw: dict[str, torch.Tensor] = {}
         for f in sorted(folder.glob("*.safetensors")):
-            sd.update(load_file(str(f), device=str(device)))
-        sd = {k: v.to(dtype) for k, v in sd.items()}
+            raw.update(load_file(str(f), device=str(device)))
+        # Convert one tensor at a time and drop the original at once, so a bf16 -> fp32 load never holds both
+        # copies of the model (1.5B on CPU: 3.1 + 6.2 GB at once was too close to WSL's 11 GB cap; M10).
+        sd = {k: raw.pop(k).to(dtype) for k in list(raw)}
         return cls(cfg, sd)
+
+    def with_fused_ops(self) -> "Qwen2Model":
+        """M10: the same model (shared weights, no copies) whose token-wise ops run as fused Triton kernels:
+        one-pass RMSNorm (+ residual add), merged QKV GEMM + RoPE + KV write, merged gate/up GEMM + SiLU*mul.
+        The original object stays unfused: it is the path that matches HF bit for bit. (Its per-matrix weights
+        become views of the merged ones: same values, same layout, so its results don't change.)"""
+        for layer in self.layers:
+            layer.merge()
+        m = copy.copy(self)
+        m.fused = True
+        return m
+
+    def final_norm(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fused:
+            from nanoserve.kernels.fused import rms_norm as fused_rms_norm
+            return fused_rms_norm(x, self.norm, self.cfg.rms_norm_eps)
+        return rms_norm(x, self.norm, self.cfg.rms_norm_eps)
 
     def named_weights(self) -> dict[str, torch.Tensor]:
         """Weights under their HF names (used by tests to prove loading is exact)."""
@@ -182,6 +224,15 @@ class Qwen2Model:
         """Token-wise first half of layer i: RMSNorm, Q/K/V projections, RoPE, KV write.
         x: [1, N, hidden]. Returns q [1, N, n_heads, hd], k and v [1, N, n_kv_heads, hd]."""
         layer = self.layers[i]
+        if self.fused:
+            # M10: 3 kernels (norm, ONE QKV GEMM with bias, RoPE + KV write) instead of ~23.
+            from nanoserve.kernels.fused import rms_norm as fused_rms_norm, rope_qkv
+            cfg = self.cfg
+            qkv = F.linear(fused_rms_norm(x, layer.ln1, cfg.rms_norm_eps), layer.qkv_w, layer.qkv_b)[0]
+            q, k, v = rope_qkv(qkv, cos[0], sin[0], cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
+                               paged.k[i] if paged is not None else None,
+                               paged.v[i] if paged is not None else None, slot_mapping)
+            return q[None], k[None], v[None]
         h = rms_norm(x, layer.ln1, self.cfg.rms_norm_eps)
         N = h.shape[1]
         hd = self.cfg.head_dim
@@ -199,6 +250,11 @@ class Qwen2Model:
     def _post(self, i: int, x: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
         """Token-wise second half of layer i: output projection + residual, RMSNorm, SwiGLU MLP + residual."""
         layer = self.layers[i]
+        if self.fused:
+            # M10: residual add fused into the norm; ONE gate/up GEMM; SiLU*mul in one kernel.
+            from nanoserve.kernels.fused import rms_norm as fused_rms_norm, silu_mul
+            h, x = fused_rms_norm(F.linear(o, layer.o_w), layer.ln2, self.cfg.rms_norm_eps, residual=x)
+            return x + F.linear(silu_mul(F.linear(h, layer.gate_up_w)), layer.down_w)
         x = x + F.linear(o, layer.o_w)
         h = rms_norm(x, layer.ln2, self.cfg.rms_norm_eps)
         return x + F.linear(F.silu(F.linear(h, layer.gate_w)) * F.linear(h, layer.up_w), layer.down_w)
@@ -290,8 +346,7 @@ class Qwen2Model:
         for seq in seqs:
             if seq.cache is not None:
                 seq.cache.advance(seq.n_tokens)
-        x = rms_norm(x, self.norm, self.cfg.rms_norm_eps)
-        return self.lm_head_rows(x, seqs, logits)
+        return self.lm_head_rows(self.final_norm(x), seqs, logits)
 
     def lm_head_rows(self, x: torch.Tensor, seqs: list[SeqInput], logits="last") -> torch.Tensor:
         """Final-normed hidden states [1, N, hidden] -> logits for the requested rows (see forward_batch)."""

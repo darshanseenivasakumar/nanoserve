@@ -589,3 +589,93 @@ event in ~26k gaps).
 - DECISION: keep the 2048 default. 512 trades better TTFT p50 and much smaller worst-case token gaps for
   worse TTFT p99 and maybe 1-3% throughput (noise-level here). It is the better setting for interactive
   chat; noted in the README instead of changing the default without a dedicated same-session A/B.
+
+## 2026-11-11 — M10 plan: operator fusion with Triton (user: "continue to the next phase")
+Profile first (bench/runs/m10_profile.py; eager step under torch.profiler = the kernels a graph replays):
+| step | kernels | GEMM | elementwise + copy + norm | attention | graphed wall vs summed kernels |
+|---|---|---|---|---|---|
+| decode B=1 | 1052 | 6.71 ms (76%) | 1.79 ms (20%; ~830 kernels, ~2 us each) | 0.35 ms | 10.10 vs 8.85 ms |
+| decode B=32 | 1081 | 8.30 ms (79%) | 1.63 ms | 0.61 ms | 11.91 vs 10.53 ms |
+| prefill T=2048 | 980 | 108.4 ms (65%) | 59.4 ms (35%) | (SDPA ~0) | eager |
+- Prefill elementwise is memory-bound and matches a byte count: unfused fp32 RMSNorm (~6 passes), RoPE
+  (mul, neg, cat, mul, add), SiLU then mul, residual adds = ~310 MB/layer = 7.4 GB/step -> 44 ms at
+  ~168 GB/s (measured 46 ms).
+- Decode: each tiny kernel costs ~2 us whatever it does, plus ~1.2 us of gap per graph node.
+- GEMMs are at the weight-read floor (1 GB of weights per step); fusion can't help them.
+
+Plan:
+- Triton kernels (nanoserve/kernels/fused.py): (1) RMSNorm in one pass, optionally with the residual
+  add fused in (residual out = x + a, normed out); (2) SiLU(gate) * up in one pass; (3) RoPE for q and k
+  of the merged QKV output + the paged KV write, one program per token.
+- Merged weights: Q/K/V as one [q;k;v] matrix + bias, gate/up as one matrix; the old per-matrix names
+  become row VIEWS of the merged tensors (no extra memory; the unfused path stays bitwise-HF).
+- Per layer 42 -> ~12 kernels. Each kernel keeps PyTorch's rounding points (bf16 round after every op
+  PyTorch rounds), so the only difference is the order of the fp32 sum inside RMSNorm.
+- Fused path = model.with_fused_ops() (a view sharing weights), on by default wherever the Triton
+  attention is (same bundle as CUDA graphs). The M1 Engine (the HF-exact reference) stays unfused.
+Predictions: decode B=1 10.1 -> ~8 ms; prefill 2048 168 -> ~135 ms.
+Gates (tests first): each kernel vs its PyTorch reference (fp32 tight; bf16 >= 99% bitwise, rest within
+1 bf16 ulp); RoPE kernel writes exactly the step's slots; merged weights are views; model fused vs unfused
+logits: tie rule; engine fused vs unfused (graphs + piecewise + chunked budget 64): tie rule, no leaks;
+existing 130 + 7 tests stay green.
+
+M10 code: nanoserve/kernels/fused.py (rms_norm [+ residual], silu_mul, rope_qkv + paged KV write);
+LayerWeights.merge() builds [q;k;v] + bias and [gate;up] lazily, per-matrix fields become views;
+Qwen2Model.with_fused_ops() (shared weights); LLMEngine(fused_ops=None -> on with the Triton attention);
+flags --no-fused-ops (server, harness). Speculative engine left unfused (flag).
+Tests (14 new; 144 default + 7 spec passed): every kernel BITWISE equal to the PyTorch ops on 2048-row
+bf16 inputs (match rate 1.00000 for rms_norm, silu_mul, rope); cache write hits exactly the given slots;
+merged weights are views; model fused vs unfused: max |logit diff| 0.31-0.38, argmax equal; engine
+(graphs + piecewise + budget 64): 10/12 identical, 2 diverge at ties (gap 0.125). Since the kernels are
+bitwise, the remaining difference comes from the merged GEMMs (one cuBLAS kernel for Q/K/V picks a
+different accumulation order than three). The bitwise-vs-HF tests still pass on view-backed weights.
+- FAILED first (rounding): the RoPE kernel written with x.to(bf16).to(fp32) round trips matched PyTorch on
+  only 84% of outputs, although the same math emulated in PyTorch matched 100%. The compiled kernel did not
+  keep the rounding of the products feeding the add/sub; neither "one product left unrounded (FMA)" model
+  explained it exactly (88.6%), so the exact transformation is NOT pinned down. Fix: round fp32 -> bf16
+  with integer bit operations (round half to even) that the compiler cannot fold or contract -> 100%.
+- FAILED first (memory): merging at load time held originals + merged copies (+50% weights). WSL crashed
+  (VM restarted, uptime 0) twice during the speculative tests, which load the 1.5B model in fp32 on CPU.
+  Fix: merge lazily in with_fused_ops(), one layer at a time (originals freed as fields become views);
+  CPU reference models are never merged. Also from_pretrained now converts dtype tensor by tensor; this
+  did NOT measurably change the peak (11.06 GB) and is kept only because it is harmless.
+- FLAG (pre-existing): the speculative test session peaks at ~11.5 GB RSS on the pre-M10 code too
+  (measured in a worktree at bc438bb), i.e. right at the 11 GB WSL cap. Raising `memory=` in
+  C:\Users\Lenovo\.wslconfig would remove the risk (a Windows setting: the user's call).
+
+Probe (bench/runs/m10_step_probe.py; same weights + pool, interleaved, median of 3 x 20):
+| step | unfused | fused | speedup | predicted |
+|---|---|---|---|---|
+| kernels / decode step | 1052 | 325 | | ~300 |
+| decode B=1 (graph) | 10.27 ms | 8.43 ms | 1.22x | ~8 ms |
+| decode B=8 (graph) | 11.16 | 8.90 | 1.25x | |
+| decode B=32 (graph) | 12.64 | 10.24 | 1.23x | |
+| mixed 32+128 (piecewise) | 23.59 | 18.88 | 1.25x | |
+| prefill 2048 (eager) | 165.99 | 130.52 | 1.27x | ~135 ms |
+- The profile-based predictions held: ~-2 ms per decode step (fewer kernels and fewer graph-node gaps),
+  -35 ms per 2048-token prefill (fewer bytes moved by elementwise ops).
+
+M10 server A/B (bench/runs/m10_bench.sh; fused off = the M9 engine, then on; vLLM control at EVERY
+concurrency and on both workloads; one session; 0 problems):
+| fixed 128 | c=1 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|---|
+| tok/s off / **on** | 96.2 / **110.5** | 326.7 / **376.6** | 576.0 / **666.3** | 990.2 / **1136.7** | 1523.1 / **1769.2** |
+| vLLM tok/s | 124.5 | 447.9 | 823.9 | 1438.4 | 2274.7 |
+| on / vLLM | 89% | 84% | 81% | 79% | 78% |
+| TTFT p50/p99 off | 28/66 | 62/147 | 136/188 | 243/344 | 339/587 |
+| TTFT p50/p99 on | 22/50 | 52/117 | 112/167 | 185/308 | 336/502 |
+| TTFT p50/p99 vLLM | 28/57 | 59/142 | 97/156 | 202/318 | 345/517 |
+| TPOT p50 off / on / vLLM | 10.3/8.9/8.0 | 11.7/10.2/8.6 | 13.1/11.4/8.9 | 14.2/12.6/9.7 | 18.4/15.4/11.4 |
+| varied 16-256 | | c=4 | c=8 | c=16 | c=32 |
+| tok/s off / **on** | | 324.0 / **371.5** | 544.2 / **623.5** | 898.5 / **1023.7** | 1204.4 / **1390.0** |
+| vLLM tok/s | | 448.0 | 782.6 | 1314.6 | 1767.1 |
+| TTFT p50 off / on / vLLM | | 35/31/43 | 40/35/46 | 53/45/66 | 141/85/111 |
+| TPOT p50 off / on / vLLM | | 12.0/10.5/8.6 | 13.4/11.8/9.2 | 15.5/13.5/10.4 | 19.4/17.2/13.4 |
+=> +14-16% throughput at every load on both workloads (fixed +14.8..+16.2%, varied +13.9..+15.4%); TPOT
+p50 -1.4..-3.0 ms. nanoserve = 78-89% of vLLM (was 69-79% in M9).
+- FLAG (unexplained): our median TTFT is now BELOW vLLM's at most loads (all varied levels; fixed c=1, 4,
+  16, 32), but not at fixed c=8 (112 vs 97 ms). Not investigated; vLLM's per-request API-server path
+  (separate process, detokenization) is a plausible, untested reason.
+- Fixed c=32 ITL p99: off 154 ms (one unfused 2048-token prefill step ~166 ms) -> on 71 ms (vLLM 97).
+- The "off" rows reproduce M9's numbers within 1-3% (e.g. c=32 1523 vs 1548), so this session was not
+  unusually fast or slow.

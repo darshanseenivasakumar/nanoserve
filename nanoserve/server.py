@@ -186,6 +186,8 @@ def main(argv=None) -> None:
     p.add_argument("--no-cuda-graphs", action="store_true", help="disable all CUDA graphs")
     p.add_argument("--no-piecewise-graphs", action="store_true",
                    help="run mixed prefill+decode steps eagerly (M9 default: piecewise CUDA graphs)")
+    p.add_argument("--no-fused-ops", action="store_true",
+                   help="unfused PyTorch ops instead of M10's fused Triton kernels")
     p.add_argument("--draft-model", default=None, help="enable speculative decoding with this draft model")
     p.add_argument("--num-speculative-tokens", type=int, default=4)
     args = p.parse_args(argv)
@@ -205,7 +207,8 @@ def main(argv=None) -> None:
                         max_num_batched_tokens=args.max_num_batched_tokens, kv_cache="paged",
                         kv_cache_tokens=kv_tokens, attn_backend=args.attn_backend,
                         cuda_graphs=False if args.no_cuda_graphs else None,
-                        piecewise_graphs=False if (args.no_cuda_graphs or args.no_piecewise_graphs) else None)
+                        piecewise_graphs=False if (args.no_cuda_graphs or args.no_piecewise_graphs) else None,
+                        fused_ops=False if args.no_fused_ops else None)
         # Capture every graph before accepting traffic (vLLM does the same), so no request pays for one.
         print(f"captured CUDA graphs in {llm.capture_graphs():.1f} s", flush=True)
     app = create_app(AsyncEngine(llm), tokenizer, args.model)
