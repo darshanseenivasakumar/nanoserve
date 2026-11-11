@@ -399,3 +399,29 @@ Graph usage: e.g. k=2 c=1: 6,984 graphed draft steps + 3,492 graphed verificatio
 - Flag: the result files' backend info for these spec runs says "attn_backend": "sdpa" -- a stale label in
   the harness backend (fixed after the run); engine_stats in the same files show cuda_graphs true and the
   graph step counts above.
+
+## 2026-11-11 — M8: time to first token (user: "continue to the next phase")
+Profile first (bench/runs/m8_ttft_profile.py, synchronous closed loop c=32, graphs on, 128 requests after
+the cold-start wave):
+- TTFT p50/p90 592/606 ms = queue wait p50 **0 ms** + admitting step p50 **592 ms**. With fixed output
+  lengths the closed loop synchronises: 32 requests finish together, 32 new ones arrive together, and the
+  scheduler prefills all ~6.7-7.8k prompt tokens in ONE step. Everyone waits for the whole burst.
+- Decode-only steps median 13.0 ms (graphed); mixed steps median 592 ms.
+- One 16-prompt / 2,919-token prefill step: 236 ms wall, GPU ~100% busy (compute-bound), 1,396 kernels.
+  GPU time: GEMM 70% (~11 TFLOPS achieved), elementwise 23% (RMSNorm, RoPE, SiLU, residual adds: fusable),
+  index/copy 6%, reductions 1%.
+- vLLM's source: on GPUs < 70 GB its API server defaults to max_num_batched_tokens = 2048 with chunked
+  prefill (we used 8192). Hypothesis: that budget explains most of the TTFT gap.
+
+M8a: budget sweep, no code change (bench/runs/m8a_budget_sweep.sh; in-process, same session):
+| budget | fixed c=8 TTFT p50 | fixed c=32 TTFT p50/p99 | c=32 tok/s | c=32 TPOT p50/p99 | var c=32 TTFT p50/p99 | var c=32 TPOT p99 |
+|---|---|---|---|---|---|---|
+| 8192 | 167 | 543 / 637 | 1698.2 | 14.3 / 18.4 | 100 / 567 | 21.1 |
+| 2048 | 162 | **334** / 596 | 1654.2 | 16.6 / 18.7 | 93 / 587 | 28.5 |
+| "1024" (really 2048, see below) | 159 | 328 / 594 | 1622.4 | 17.1 / 19.1 | 100 / 591 | 28.8 |
+- Budget 2048: TTFT p50 -38% at c=32 fixed (543 -> 334 ms), equal to vLLM's 335. p99 unchanged (the
+  last group of a burst still waits for all of the burst's compute; vLLM p99 545). Cost: -2.6% tok/s,
+  +2.3 ms TPOT p50 (more steps contain a prefill and run eagerly, without graphs).
+- FAILED/FLAG: the "1024" run silently ran at 2048 -- LLMEngine raises the paged budget to max_seq_len
+  (2048) because, without chunked prefill, a preempted request must re-prefill prompt + outputs in one
+  step. That floor is the concrete reason to build chunked prefill (M8b).
