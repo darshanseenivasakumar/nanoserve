@@ -180,7 +180,7 @@ def main(argv=None) -> None:
     p.add_argument("--port", type=int, default=8002)
     p.add_argument("--max-seq-len", type=int, default=2048)
     p.add_argument("--max-num-seqs", type=int, default=64)
-    p.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    p.add_argument("--max-num-batched-tokens", type=int, default=2048, help="per-step token budget (vLLM default on <70 GB GPUs)")
     p.add_argument("--kv-cache-gb", type=float, default=2.0, help="explicit KV budget (GiB)")
     p.add_argument("--attn-backend", choices=["triton", "sdpa"], default=None)
     p.add_argument("--no-cuda-graphs", action="store_true", help="disable CUDA-graph decode steps")

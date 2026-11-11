@@ -57,7 +57,7 @@ class StepStats:
 
 class LLMEngine:
     def __init__(self, model: Qwen2Model, eos_token_ids: list[int], max_seq_len: int = 2048,
-                 policy: str = "continuous", max_num_seqs: int = 8, max_num_batched_tokens: int = 8192,
+                 policy: str = "continuous", max_num_seqs: int = 8, max_num_batched_tokens: int = 2048,
                  batch_wait_s: float = 0.02, kv_cache: str = "paged", kv_cache_tokens: int | None = None,
                  block_size: int = 16, attn_backend: str | None = None, cuda_graphs: bool | None = None,
                  chunked_prefill: bool | None = None):

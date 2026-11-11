@@ -212,7 +212,7 @@ def parse_args(argv=None):
     p.add_argument("--no-cuda-graphs", dest="cuda_graphs", action="store_false")
     p.add_argument("--attn-backend", choices=["triton", "sdpa"], default=None,
                    help="nanoserve attention (default: triton kernel on GPU for the paged cache)")
-    p.add_argument("--max-num-batched-tokens", type=int, default=8192, help="nanoserve: per-step token budget")
+    p.add_argument("--max-num-batched-tokens", type=int, default=2048, help="nanoserve: per-step token budget (M8 default)")
     p.add_argument("--output-len-range", default=None,
                    type=lambda s: tuple(int(x) for x in s.split(",")),
                    help="LO,HI: per-request output length drawn (seeded) from [LO, HI] instead of --max-tokens")

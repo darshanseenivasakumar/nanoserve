@@ -23,7 +23,7 @@ DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch
 
 class NanoserveBackend:
     def __init__(self, model_name: str, device: str = "cuda", dtype: str = "bfloat16", max_seq_len: int = 2048,
-                 policy: str = "continuous", max_num_batched_tokens: int = 8192, kv_cache: str = "paged",
+                 policy: str = "continuous", max_num_batched_tokens: int = 2048, kv_cache: str = "paged",
                  kv_cache_tokens: int | None = None, block_size: int = 16, attn_backend: str | None = None,
                  draft_model: str | None = None, num_speculative_tokens: int = 4, cuda_graphs: bool | None = None,
                  engine: LLMEngine | None = None):
