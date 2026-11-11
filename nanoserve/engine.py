@@ -59,7 +59,8 @@ class LLMEngine:
     def __init__(self, model: Qwen2Model, eos_token_ids: list[int], max_seq_len: int = 2048,
                  policy: str = "continuous", max_num_seqs: int = 8, max_num_batched_tokens: int = 8192,
                  batch_wait_s: float = 0.02, kv_cache: str = "paged", kv_cache_tokens: int | None = None,
-                 block_size: int = 16, attn_backend: str | None = None, cuda_graphs: bool | None = None):
+                 block_size: int = 16, attn_backend: str | None = None, cuda_graphs: bool | None = None,
+                 chunked_prefill: bool | None = None):
         """kv_cache: "paged" (M3, default) or "contiguous" (M1/M2). kv_cache_tokens: the explicit KV budget
         in tokens (default 32 x max_seq_len)."""
         self.model = model
@@ -73,14 +74,19 @@ class LLMEngine:
         if kv_cache == "paged":
             self.kv = PagedKVManager(model.cfg, budget, block_size, device=model.device, dtype=model.dtype,
                                      attn_backend=attn_backend)
-            # A preempted request re-prefills prompt + outputs (up to max_seq_len tokens) in ONE step.
-            max_num_batched_tokens = max(max_num_batched_tokens, max_seq_len)
+            if chunked_prefill is None:
+                chunked_prefill = True               # M8 default for the paged cache
+            if not chunked_prefill:
+                # Without chunking a preempted request re-prefills prompt + outputs (up to max_seq_len
+                # tokens) in ONE step, so the budget can't be smaller than that.
+                max_num_batched_tokens = max(max_num_batched_tokens, max_seq_len)
         elif kv_cache == "contiguous":
             self.kv = ContiguousKVManager(model.cfg, max_seq_len, budget, device=model.device, dtype=model.dtype)
         else:
             raise ValueError(f"unknown kv_cache {kv_cache!r}")
+        self.chunked_prefill = bool(chunked_prefill) and kv_cache == "paged"   # contiguous can't chunk
         self.scheduler = Scheduler(policy, max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens,
-                                   batch_wait_s=batch_wait_s, kv=self.kv)
+                                   batch_wait_s=batch_wait_s, kv=self.kv, chunked_prefill=self.chunked_prefill)
         # M7: CUDA graphs for pure-decode steps (needs the paged cache + Triton kernel; on by default there).
         if cuda_graphs is None:
             cuda_graphs = kv_cache == "paged" and attn_backend == "triton"
@@ -91,7 +97,8 @@ class LLMEngine:
         self.sequences: dict[int, Sequence] = {}   # unfinished only
         self.last_step: StepStats | None = None
         self._next_id = 0
-        self._stats = {"steps": 0, "graph_steps": 0, "peak_running": 0, "kv_used_tokens_peak": 0,
+        self._stats = {"steps": 0, "graph_steps": 0, "prefill_chunks": 0, "peak_running": 0,
+                       "kv_used_tokens_peak": 0,
                        "kv_reserved_tokens_peak": 0, "kv_util_sum": 0.0, "kv_util_samples": 0}
 
     def reset_stats(self) -> None:
@@ -147,12 +154,12 @@ class LLMEngine:
         m = self.model
         self.kv.begin_step()
         tokens, positions, inputs, counts = [], [], [], []
-        for seq in plan.scheduled:
-            t, p = seq.step_tokens()
+        for seq, n in zip(plan.scheduled, plan.chunks):
+            t, p = seq.step_tokens(n)
             tokens += t
             positions += p
-            inputs.append(self.kv.seq_input(seq, len(t)))
-            counts.append(len(t))
+            inputs.append(self.kv.seq_input(seq, n))
+            counts.append(n)
         n_prefill = sum(seq.is_prefill for seq in plan.scheduled)
         self.last_step = StepStats(n_prefill=n_prefill, n_decode=len(plan.scheduled) - n_prefill,
                                    n_tokens=len(tokens))
@@ -176,6 +183,10 @@ class LLMEngine:
 
         outputs = []
         for seq, tok in zip(plan.scheduled, next_tokens):
+            if seq.num_cached < seq.num_tokens:
+                # M8: a non-final prefill chunk -- its last logit is mid-prompt, nothing to sample.
+                self._stats["prefill_chunks"] += 1
+                continue
             seq.output_ids.append(tok)
             finished = (tok in self._eos and not seq.ignore_eos) or len(seq.output_ids) >= seq.max_new_tokens
             if finished:

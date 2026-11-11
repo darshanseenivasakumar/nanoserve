@@ -43,39 +43,48 @@ class Sequence:
     num_cached: int = 0                # tokens whose K/V are stored. 0 => this sequence must (re)prefill.
 
     @property
-    def is_prefill(self) -> bool:
-        """No KV stored: a new request, or one that was PREEMPTED and lost its KV (M3)."""
-        return self.num_cached == 0
-
-    @property
     def num_tokens(self) -> int:
         return len(self.prompt_ids) + len(self.output_ids)
 
-    def step_tokens(self) -> tuple[list[int], list[int]]:
-        """(token ids, positions) this sequence feeds into the next forward pass.
+    @property
+    def remaining(self) -> int:
+        """Known tokens whose K/V is not stored yet."""
+        return self.num_tokens - self.num_cached
 
-        Prefill feeds every known token (prompt + any outputs kept across a preemption) and its last logit
-        predicts the next token. Decode feeds only the newest output token, whose K/V isn't stored yet.
+    @property
+    def is_prefill(self) -> bool:
+        """Prefilling: a new request, a PREEMPTED one recomputing its KV (M3), or one part-way through a
+        CHUNKED prefill (M8). Decoding = exactly one uncached token (the newest output)."""
+        return self.num_cached == 0 or self.remaining > 1
+
+    def step_tokens(self, n: int | None = None) -> tuple[list[int], list[int]]:
+        """(token ids, positions) for the next n uncached tokens (default: all of them).
+
+        One rule covers everything: feed tokens[num_cached : num_cached + n]; if that reaches the end of the
+        known tokens, the last logit predicts the next token. Decode = n is 1 and only the newest output is
+        uncached. Prefill = the whole prompt (+ outputs kept across a preemption), possibly in chunks.
         """
-        if self.is_prefill:
-            toks = self.prompt_ids + self.output_ids
-            return list(toks), list(range(len(toks)))
-        return [self.output_ids[-1]], [self.num_tokens - 1]
+        n = self.remaining if n is None else n
+        if n == 1 and self.remaining == 1 and self.output_ids:      # fast path: plain decode
+            return [self.output_ids[-1]], [self.num_tokens - 1]
+        toks = (self.prompt_ids + self.output_ids)[self.num_cached:self.num_cached + n]
+        return toks, list(range(self.num_cached, self.num_cached + n))
 
     @property
     def step_cost(self) -> int:
-        return self.num_tokens if self.is_prefill else 1
+        return self.remaining
 
 
 @dataclass
 class SchedulerOutput:
-    scheduled: list[Sequence]   # everyone running this step (decodes + new prefills), in batch order
-    admitted: list[Sequence]    # the subset newly admitted this step (need a KV cache)
+    scheduled: list[Sequence]   # everyone running this step (decodes + prefill chunks), in batch order
+    admitted: list[Sequence]    # the subset newly admitted this step (KV reserved for them)
+    chunks: list[int] = field(default_factory=list)   # tokens each scheduled sequence processes this step
 
 
 class Scheduler:
     def __init__(self, policy: str = "continuous", max_num_seqs: int = 8, max_num_batched_tokens: int = 8192,
-                 batch_wait_s: float = 0.02, kv=None):
+                 batch_wait_s: float = 0.02, kv=None, chunked_prefill: bool = False):
         if policy not in ("static", "continuous"):
             raise ValueError(f"unknown policy {policy!r}")
         self.policy = policy
@@ -83,14 +92,17 @@ class Scheduler:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.batch_wait_s = batch_wait_s
         self.kv = kv                      # KV manager (nanoserve/kv_manager.py) or None = unlimited (M2 tests)
+        # M8: split prefills into budget-sized chunks across steps (needs the paged cache: later chunks
+        # attend over an existing context). Off = a prefill must fit the per-step budget in one piece.
+        self.chunked_prefill = chunked_prefill
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []
         self.num_preemptions = 0
 
     def add(self, seq: Sequence) -> None:
-        if len(seq.prompt_ids) > self.max_num_batched_tokens:
+        if not self.chunked_prefill and len(seq.prompt_ids) > self.max_num_batched_tokens:
             raise ValueError(f"prompt of {len(seq.prompt_ids)} tokens exceeds the per-step token budget "
-                             f"({self.max_num_batched_tokens}); chunked prefill is not implemented")
+                             f"({self.max_num_batched_tokens}) and chunked prefill is off")
         if self.kv is not None and not self.kv.can_ever_fit(len(seq.prompt_ids) + seq.max_new_tokens):
             raise ValueError(f"request needs up to {len(seq.prompt_ids) + seq.max_new_tokens} tokens of KV, "
                              f"more than the whole KV budget: it could never finish")
@@ -145,19 +157,40 @@ class Scheduler:
         return len(self.waiting) >= self.max_num_seqs or now - self.waiting[0].arrival_time >= self.batch_wait_s
 
     def schedule(self, now: float) -> SchedulerOutput:
+        """Budget order: (1) running decodes, 1 token each, always; (2) running requests part-way through a
+        chunked prefill; (3) new admissions (FCFS). With chunked prefill a prefill takes whatever budget is
+        left (min(remaining, budget)) and continues next step; without it, it must fit in one piece."""
         if self.kv is not None:
             self._reserve_decode_slots()
+        budget = self.max_num_batched_tokens
+        scheduled, chunks = [], []
+        partial = []
+        for seq in self.running:
+            if seq.is_prefill:
+                partial.append(seq)
+            else:
+                scheduled.append(seq)
+                chunks.append(1)
+                budget -= 1
+        for seq in partial:                       # only exists with chunked prefill
+            n = min(seq.remaining, budget) if self.chunked_prefill else seq.remaining
+            if n > 0:
+                scheduled.append(seq)
+                chunks.append(n)
+                budget -= n
         admitted: list[Sequence] = []
         if self._may_admit(now):
-            budget = self.max_num_batched_tokens - sum(s.step_cost for s in self.running)
             while (self.waiting and len(self.running) + len(admitted) < self.max_num_seqs
-                   and self.waiting[0].step_cost <= budget
+                   and (budget > 0 if self.chunked_prefill else self.waiting[0].step_cost <= budget)
                    and (self.kv is None or self.kv.can_admit(self.waiting[0]))):
                 seq = self.waiting.popleft()
-                budget -= seq.step_cost
+                n = min(seq.step_cost, budget) if self.chunked_prefill else seq.step_cost
+                budget -= n
                 if self.kv is not None:
-                    self.kv.admit(seq)
+                    self.kv.admit(seq)             # reserves KV for ALL of its known tokens
                 seq.status = SeqStatus.RUNNING
                 admitted.append(seq)
+                scheduled.append(seq)
+                chunks.append(n)
             self.running.extend(admitted)
-        return SchedulerOutput(scheduled=list(self.running), admitted=admitted)
+        return SchedulerOutput(scheduled=scheduled, admitted=admitted, chunks=chunks)
