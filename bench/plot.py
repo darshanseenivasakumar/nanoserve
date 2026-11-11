@@ -75,7 +75,9 @@ def plot(tags: list[str], out: Path, label: str) -> Path | None:
     panel(axes[1], data, "ttft:p50", "TTFT p50", "ms", logy=True)
     panel(axes[2], data, "ttft:p99", "TTFT p99", "ms", logy=True)
     panel(axes[3], data, "tpot:p50", "TPOT p50 (time per output token)", "ms", logy=True)
-    fig.suptitle("Qwen2.5-0.5B-Instruct, RTX 3050 6GB laptop, 64 prompts, greedy", fontsize=10)
+    # Model name from the results (was hard-coded to 0.5B until M14 mislabelled the 1.5B plot).
+    models = sorted({d["args"]["model"].split("/")[-1] for by_c in data.values() for d in by_c.values()})
+    fig.suptitle(f"{' + '.join(models)}, RTX 3050 6GB laptop, 64 prompts, greedy", fontsize=10)
     fig.tight_layout()
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{tag}.png"

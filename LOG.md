@@ -858,3 +858,45 @@ Tests: 175 default + 8 spec passed (spec now includes M14's 1.5B fast-path test)
   FLAG: 0.250 is exactly at the tie-rule limit (<= 0.25), accepted by the rule but with no margin.
 - 1.5B fp16 GGUF downloaded (resumed after the WSL restart) and verified: 3,560,416,288 bytes = the size in
   the HF tree listing, GGUF magic present.
+
+## 2026-11-11 — M14: bigger models (the original spec: "develop on 0.5B, then 1.5B"; 3B on a cloud GPU)
+- 1.5B on the laptop (bench/runs/m14_1p5b.sh): nanoserve server (KV 1 GiB: weights take ~3.1 GB of the
+  6 GB), vLLM (GPU_UTIL 0.8), llama.cpp 8 slots (its best laptop config), one session, prefix caching off,
+  fixed 128 + varied 16-256 outputs. Correctness gate already passed: tests/test_1p5b.py (tie rule).
+- 3B: bench/runs/cloud_3b.sh, one command on a rented >= 24 GB Linux GPU (NOT run: needs the user to rent
+  one). The 3B fp16 GGUF is split into 2 parts (verified on the HF API); build_llamacpp.sh downloads both.
+
+M14 1.5B benchmark (bench/runs/m14_1p5b.sh; nanoserve + vLLM ran 2026-11-11 ~21:10-21:50 IST, llama.cpp
+after a user-requested pause, ~23:20 IST; same machine, same day). 0 fairness problems.
+Fixed 128:
+| engine | c=1 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|---|
+| **nanoserve** | **42.8** | **150.6** | **274.6** | **481.9** | **753.1** |
+| vLLM 0.33.0 | 44.4 | 162.0 | 301.3 | 530.4 | 858.1 |
+| llama.cpp b12247, 8 slots | 46.8 | 94.1 | 261.8 | – | – |
+| **nanoserve / vLLM** | **96%** | **93%** | **91%** | **91%** | **88%** |
+| TTFT p50 / p99 (ms), nanoserve vs vLLM | 57/130 vs 62/139 | 160/459 vs 149/394 | 403/461 vs 271/480 | 435/843 vs 454/793 | 1029/1573 vs 904/1535 |
+| TPOT p50 (ms), nanoserve vs vLLM | 22.9 vs 22.1 | 25.2 vs 23.2 | 26.1 vs 24.0 | 28.7 vs 25.6 | 35.9 vs 29.3 |
+Varied 16-256:
+| engine | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|
+| **nanoserve** | **149.7** | **261.5** | **445.9** | **595.2** |
+| vLLM 0.33.0 | 162.4 | 286.2 | 488.9 | 676.6 |
+| llama.cpp b12247, 8 slots | 84.9 | 214.3 | – | – |
+| **nanoserve / vLLM** | **92%** | **91%** | **91%** | **88%** |
+| TTFT p50 / p99 (ms), nanoserve vs vLLM | 77/206 vs 100/191 | 89/355 vs 104/335 | 101/780 vs 113/617 | 262/1452 vs 223/1361 |
+| TPOT p50 (ms), nanoserve vs vLLM | 26.1 vs 23.8 | 27.6 vs 25.1 | 31.0 vs 28.4 | 36.9 vs 33.4 |
+=> nanoserve 88-96% of vLLM on 1.5B (0.5B in M11: 89-94%). Weight reading sets a floor of ~18 ms per
+step (3.1 GB / ~168 GB/s, bandwidth estimated, not measured); both engines are at ~22-23 ms at c=1.
+- FLAG: vLLM's TTFT is better under load on 1.5B (fixed c=8 p50 403 vs 271 ms, c=32
+  1029 vs 904); on 0.5B ours was lower. Not investigated: prefill is ~3x the compute
+  per token here, so how a burst's prefill is sliced across steps matters more.
+- llama.cpp (8 slots) is the FASTEST at c=1 on 1.5B (46.8 tok/s vs nanoserve 42.8, vLLM
+  44.4); nanoserve beats it at c=4 and c=8. Its c=4 dip (TPOT 47 ms) repeats the 0.5B
+  pattern (M6: 193.8 tok/s at c=4 vs 485.6 at c=8); cause not investigated.
+- FLAG: llama.cpp ran ~1.5 h after the other two (the session was paused and WSL restarted); same
+  machine and build, but not strictly the same session.
+- 3B: NOT run (needs a rented GPU); bench/runs/cloud_3b.sh is the one-command kit.
+- FAILED first (plot label): bench/plot.py had the title "Qwen2.5-0.5B-Instruct, ..." hard-coded, so the
+  first 1.5B plot was mislabelled (caught by looking at the image before committing). Now the title is
+  built from args.model in the result files; all earlier plots were 0.5B and are unaffected.

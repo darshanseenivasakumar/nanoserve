@@ -301,6 +301,13 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
   seed gives the same text whatever else is in the batch, even after a preemption + recompute.
 - **splitmix64**: a tiny integer mixing function used to turn (seed, step) into well-spread generator seeds.
 
+## Scaling up (M14)
+- **Weight-bound decode**: at small batch sizes each decode step must read every weight once, so step time
+  >= model bytes / memory bandwidth (1.5B bf16: ~3.1 GB / ~168 GB/s ~ 18 ms). The bigger the model, the more
+  of each step is this floor, and the less engine overheads matter.
+- **Split GGUF**: big GGUF files are published in parts (`-00001-of-00002.gguf`); llama.cpp is pointed at
+  part 1 and loads the rest itself.
+
 ## Tooling
 - **uv**: a fast Python package/project manager. `uv sync` installs exactly what `pyproject.toml`/`uv.lock` say.
 - **venv (virtual environment)**: an isolated folder of Python packages. vLLM gets its own because it pins a

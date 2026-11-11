@@ -6,9 +6,17 @@ A mini LLM inference engine built from scratch to learn ML infrastructure: **con
 whose GPU loop runs in its own process. Benchmarked honestly against vLLM and llama.cpp, with every
 stage gated on matching HuggingFace's outputs.
 
-Development hardware: an RTX 3050 6 GB *laptop* GPU under WSL2, Qwen2.5-0.5B-Instruct (and 1.5B for
-speculative decoding). Everything is parameterised (`--model`, `--device`, KV budget, CUDA arch) so the
-3B run on a cloud GPU is a flag change (see "Running on a cloud GPU").
+Development hardware: an RTX 3050 6 GB *laptop* GPU under WSL2, Qwen2.5-0.5B-Instruct and 1.5B-Instruct.
+Everything is parameterised (`--model`, `--device`, KV budget, CUDA arch); the 3B benchmark on a rented GPU
+is one script (`bench/runs/cloud_3b.sh`, not run yet).
+
+**At a glance (same-session comparisons with vLLM 0.33.0):**
+
+| | throughput vs vLLM | how it got there |
+|---|---|---|
+| Qwen2.5-0.5B | 23–30% (M6) → **89–94%** (M11) | CUDA graphs, chunked prefill, piecewise graphs, Triton fusion, engine process |
+| Qwen2.5-1.5B | **88–96%** (M14) | same engine, bigger model: weights dominate, overheads matter less |
+| shared 1,024-token prompt, 0.5B | **105–111% of vLLM** from c=8 (both with prefix caching) | M12 prefix caching: 2.4x vs no caching at c=32 |
 
 ## Results
 
@@ -77,6 +85,39 @@ With a shared prefix, prefix caching is worth **2.4x** throughput at c=32 for na
 from 2.8 s to 0.38 s); with it on, nanoserve is at 92-98% of vLLM up to c=4 and **ahead from c=8**
 (105-111%). vLLM's median TTFT is better at c=32. Unexplained: vLLM got slower at c=1 with its cache on.
 
+**Qwen2.5-1.5B-Instruct (M14)** — the same benchmark on a 3x bigger model, one session, KV budget 1 GiB
+(weights take ~3.1 GB of the 6 GB). Output tokens/s:
+
+*Fixed 128 output tokens*
+
+| engine | c=1 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|---|
+| **nanoserve** | **42.8** | **150.6** | **274.6** | **481.9** | **753.1** |
+| vLLM 0.33.0 | 44.4 | 162.0 | 301.3 | 530.4 | 858.1 |
+| llama.cpp b12247, 8 slots | 46.8 | 94.1 | 261.8 | – | – |
+| **nanoserve / vLLM** | **96%** | **93%** | **91%** | **91%** | **88%** |
+| TTFT p50 / p99 (ms), nanoserve vs vLLM | 57/130 vs 62/139 | 160/459 vs 149/394 | 403/461 vs 271/480 | 435/843 vs 454/793 | 1029/1573 vs 904/1535 |
+| TPOT p50 (ms), nanoserve vs vLLM | 22.9 vs 22.1 | 25.2 vs 23.2 | 26.1 vs 24.0 | 28.7 vs 25.6 | 35.9 vs 29.3 |
+
+*Varied output lengths (16–256)*
+
+| engine | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|
+| **nanoserve** | **149.7** | **261.5** | **445.9** | **595.2** |
+| vLLM 0.33.0 | 162.4 | 286.2 | 488.9 | 676.6 |
+| llama.cpp b12247, 8 slots | 84.9 | 214.3 | – | – |
+| **nanoserve / vLLM** | **92%** | **91%** | **91%** | **88%** |
+| TTFT p50 / p99 (ms), nanoserve vs vLLM | 77/206 vs 100/191 | 89/355 vs 104/335 | 101/780 vs 113/617 | 262/1452 vs 223/1361 |
+| TPOT p50 (ms), nanoserve vs vLLM | 26.1 vs 23.8 | 27.6 vs 25.1 | 31.0 vs 28.4 | 36.9 vs 33.4 |
+
+On the bigger model nanoserve reaches **88–96% of vLLM**: each step is dominated by reading ~3.1 GB of
+weights (≥ ~18 ms at ~168 GB/s), the same for both engines, so fixed per-step overheads matter less. vLLM's
+time to first token is better under load on 1.5B (e.g. fixed c=8: 403 vs 271 ms p50).
+**llama.cpp is the fastest of the three at c=1** (46.8 vs 42.8 tok/s; TPOT 20.9 vs 22.9 ms):
+its single-stream decode path is tuned. With 8 slots it drops at c=4 (TPOT 47 ms), as on 0.5B.
+
+![1.5B fixed-length results](bench/plots/m14-1p5b.png)
+
 ![fixed-length results](bench/plots/m11-proc-on.png)
 ![varied-length results](bench/plots/m11-proc-on-var16-256.png)
 
@@ -136,6 +177,7 @@ llama.cpp's best configuration from c=8 up. Time per token is 8.7–13.8 ms vs v
 | M11 | Profile the loop under load, then move the engine into its own process (API server / engine core split) | scheduling was only 0.25 ms of a 14.9 ms step (GPU 95% busy) — the loss was GIL sharing with the HTTP thread (server −22% vs bare loop); tokens **bitwise** = in-thread engine; **+3% (c=1) to +21% (c=32): 89–94% of vLLM** |
 | M12 | Automatic prefix caching: refcounted blocks, exact-prefix trie keys, LRU eviction | fp32 tokens identical with/without (also under eviction + preemption); shared 1,024-token prompt: **2.4x tok/s at c=32**, p99 TTFT 2.8 s → 0.38 s; **ahead of vLLM (also caching) from c=8** |
 | M13 | Sampling: temperature / top-k / top-p, Gumbel-max, per-request seeded randomness | draws match exact softmax probabilities (20k-draw tests); a seed reproduces the same text whatever the batch and across preemption; temperature 0 = the old greedy path |
+| M14 | Bigger model: Qwen2.5-1.5B on the laptop; 3B cloud script | fast path vs reference within the tie rule; **88–96% of vLLM**; beats llama.cpp (8 slots) at c=4, c=8; `cloud_3b.sh` ready for a rented GPU |
 
 Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every term: [`GLOSSARY.md`](GLOSSARY.md).
 
@@ -251,7 +293,7 @@ Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every t
 ```bash
 uv sync
 uv run pytest                      # 175 tests (GPU + model download)
-uv run pytest -m spec              # 7 speculative-decoding tests (1.5B model, ~8 GB RAM)
+uv run pytest -m spec              # 8 tests on the 1.5B model (speculative decoding + fast path, ~11.5 GB RAM)
 
 # in-process engine
 uv run python -m bench.harness --backend nanoserve --concurrency 1,4,8,16,32 --kv-cache-gb 2
@@ -266,25 +308,24 @@ bash bench/servers/build_llamacpp.sh && bash bench/servers/llamacpp.sh
 
 bash bench/runs/m11_bench.sh && uv run python -m bench.plot --tag m11-proc-on,m11-proc-off,m11-vllm-control,m6
 bash bench/runs/m12_bench.sh                       # shared-prefix workload, prefix caching off/on, + vLLM
+bash bench/runs/m14_1p5b.sh                        # 1.5B: nanoserve, vLLM, llama.cpp (ONLY=<engine> for one)
 # sampling: POST /v1/completions with "temperature": 0.8, "top_p": 0.95, "seed": 1
 uv run python -m bench.runs.m11_loop_profile       # step-loop phases + GPU busy time, bare vs AsyncEngine
 uv run python -m bench.runs.m10_profile            # where GPU time goes, by kernel category
 uv run python -m bench.runs.m10_step_probe         # one step: unfused vs fused
 ```
 
-## Running on a cloud GPU (the 3B benchmark)
+## Running on a cloud GPU (the 3B benchmark — not run yet)
 
-Nothing is hard-coded to the laptop. On a Linux box with a bigger GPU:
+Nothing is hard-coded to the laptop. On a rented Linux GPU with >= 24 GB (L4, A10, 4090, A100, H100), with
+the CUDA toolkit, cmake and uv installed:
 
 ```bash
-MODEL=Qwen/Qwen2.5-3B-Instruct
-uv run python -m nanoserve.server --model $MODEL --kv-cache-gb 20 --max-num-seqs 256 --port 8002
-MODEL=$MODEL GPU_UTIL=0.9 bash bench/servers/vllm.sh
-CUDA_ARCH=90 bash bench/servers/build_llamacpp.sh      # 89 for L4/4090, 90 for H100
-GGUF_REPO=Qwen/Qwen2.5-3B-Instruct-GGUF GGUF_FILE=qwen2.5-3b-instruct-fp16.gguf bash bench/servers/build_llamacpp.sh
+git clone <this repo> ~/nanoserve && cd ~/nanoserve
+CUDA_ARCH=89 bash bench/runs/cloud_3b.sh        # 89 = L4/4090, 80 = A100, 90 = H100
 ```
-(⚠ not verified: check the exact fp16 GGUF filename in that repo first — larger GGUFs are sometimes split
-into parts, in which case point llama-server at the first part.)
-then run the harness with `--model $MODEL`. The kernel tests already cover 3B's head layout
+It runs the kernel tests on that GPU, installs vLLM, builds llama.cpp, downloads the 3B fp16 GGUF (two
+parts: `qwen2.5-3b-instruct-fp16-0000{1,2}-of-00002.gguf`, verified on the Hugging Face API), then benchmarks
+all three engines in one session (c = 1–64, fixed + varied) and plots the result. The kernel tests already cover 3B's head layout
 (16 query / 2 KV heads, dim 128). Notes: on Linux an over-budget allocation OOMs normally (on this
 Windows laptop the driver silently spills to system RAM, so capacity is measured against explicit budgets).
