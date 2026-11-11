@@ -18,6 +18,7 @@ why vLLM invented the paged KV cache.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 
 import torch
 
@@ -100,6 +101,109 @@ class BlockAllocator:
             self._free.append(b)
 
 
+class PrefixCachingAllocator:
+    """M12: block allocator with reference counts and a cache of FULL blocks keyed by their exact prefix.
+
+    vLLM's automatic prefix caching (and SGLang's RadixAttention) in miniature:
+
+      key(block i of a request) = (node id of block i-1's key, the block_size token ids of block i)
+
+    Each newly registered key gets a fresh node id, so keys form a TRIE: two blocks with equal tokens but
+    different prefixes have different keys, and lookups are exact (no hash collisions to worry about).
+
+      * A block is registered once it is FULL; partial blocks are never shared. A request that reuses
+        cached blocks only writes K/V after them, so shared blocks are never modified.
+      * ref[b] = how many block tables hold b. When it drops to 0, a registered block is not freed but
+        parked in an LRU list ("evictable"): still cached, but counted as free capacity.
+      * allocate() takes a truly free block first, else evicts the least recently freed cached block.
+
+    Same interface as BlockAllocator (allocate / free / num_free), so BlockTable works with either.
+    """
+
+    def __init__(self, base: BlockAllocator, block_size: int):
+        self.base = base
+        self.block_size = block_size
+        self.ref: dict[int, int] = {}
+        self.block_of: dict[tuple, int] = {}         # key -> block holding it
+        self.key_of: dict[int, tuple] = {}           # block -> its key (registered blocks only)
+        self.node_of: dict[int, int] = {}            # block -> node id of its key (parent of the next key)
+        self.evictable: OrderedDict[int, None] = OrderedDict()   # cached, unreferenced; LRU first
+        self._next_node = 1                          # node 0 = the empty prefix (root)
+
+    @property
+    def num_free(self) -> int:
+        return self.base.num_free + len(self.evictable)
+
+    @property
+    def num_evictable(self) -> int:
+        return len(self.evictable)
+
+    @property
+    def num_blocks(self) -> int:
+        return self.base.num_blocks
+
+    def allocate(self) -> int:
+        if self.base.num_free:
+            block = self.base.allocate()
+        elif self.evictable:
+            block, _ = self.evictable.popitem(last=False)             # least recently freed
+            del self.block_of[self.key_of.pop(block)]
+            del self.node_of[block]
+        else:
+            raise NoFreeBlocks()
+        self.ref[block] = 1
+        return block
+
+    def free(self, blocks: list[int]) -> None:
+        # Tail blocks first: they enter the LRU list first, so a request's prefix outlives its suffix.
+        for b in reversed(blocks):
+            if self.ref.get(b, 0) <= 0:
+                raise ValueError(f"block {b} freed twice (or never allocated)")
+            self.ref[b] -= 1
+            if self.ref[b] == 0:
+                del self.ref[b]
+                if b in self.key_of:
+                    self.evictable[b] = None
+                else:
+                    self.base.free([b])
+
+    def lookup(self, token_ids: list[int], max_blocks: int | None = None) -> list[int]:
+        """Blocks holding the longest cached prefix of token_ids (whole blocks only). No side effects."""
+        bs = self.block_size
+        n = len(token_ids) // bs if max_blocks is None else min(max_blocks, len(token_ids) // bs)
+        hits, parent = [], 0
+        for i in range(n):
+            b = self.block_of.get((parent, tuple(token_ids[i * bs:(i + 1) * bs])))
+            if b is None:
+                break
+            hits.append(b)
+            parent = self.node_of[b]
+        return hits
+
+    def pin(self, blocks: list[int]) -> None:
+        """A new request takes over cached blocks found by lookup()."""
+        for b in blocks:
+            if self.ref.get(b, 0) == 0:
+                del self.evictable[b]
+            self.ref[b] = self.ref.get(b, 0) + 1
+
+    def register(self, table: "BlockTable", token_ids: list[int]) -> None:
+        """Cache every block of `table` that has become full since the last call. token_ids: the request's
+        known tokens (at least table.num_tokens of them)."""
+        bs = self.block_size
+        for i in range(table.num_hashed, table.num_tokens // bs):
+            key = (table.prefix_node, tuple(token_ids[i * bs:(i + 1) * bs]))
+            existing = self.block_of.get(key)
+            if existing is None:                    # first time this prefix is seen: cache OUR block
+                b = table.blocks[i]
+                node = self._next_node
+                self._next_node += 1
+                self.block_of[key], self.key_of[b], self.node_of[b] = b, key, node
+            else:                                   # computed concurrently by someone else: keep theirs
+                node = self.node_of[existing]
+            table.prefix_node, table.num_hashed = node, i + 1
+
+
 class BlockTable:
     """One request's view of the pool: its blocks and how many of its tokens have KV stored."""
 
@@ -107,6 +211,8 @@ class BlockTable:
         self.block_size = block_size
         self.blocks: list[int] = []
         self.num_tokens = 0          # tokens whose K/V are written (committed)
+        self.num_hashed = 0          # M12: leading full blocks already processed by the prefix cache
+        self.prefix_node = 0         # M12: node id of the last of those blocks' key (0 = empty prefix)
 
     def blocks_needed(self, n_new: int) -> int:
         return max(0, math.ceil((self.num_tokens + n_new) / self.block_size) - len(self.blocks))

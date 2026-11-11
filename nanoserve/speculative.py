@@ -114,7 +114,11 @@ class SpeculativeEngine:
         return len(seq.prompt_ids) + seq.max_new_tokens + self.k + 1
 
     def add_request(self, prompt_ids: list[int], max_new_tokens: int, ignore_eos: bool = False,
-                    arrival_time: float | None = None) -> int:
+                    arrival_time: float | None = None, sampling=None) -> int:
+        if sampling is not None and not sampling.greedy:
+            # Greedy verification accepts a draft token iff it equals the target's argmax; sampling would
+            # need rejection sampling (Leviathan et al.), not built.
+            raise ValueError("speculative decoding in nanoserve is greedy-only (temperature must be 0)")
         seq = SpecSeq(self._next_id, list(prompt_ids), max_new_tokens, ignore_eos,
                       time.perf_counter() if arrival_time is None else arrival_time)
         if len(prompt_ids) + max_new_tokens > self.max_seq_len:

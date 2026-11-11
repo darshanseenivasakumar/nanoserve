@@ -31,11 +31,7 @@ def target_fp32_cpu():
     return Qwen2Model.from_pretrained(TARGET, device="cpu", dtype=torch.float32)
 
 
-@pytest.fixture(scope="module")
-def target_bf16_gpu():
-    if not torch.cuda.is_available():
-        pytest.skip("needs CUDA")
-    return Qwen2Model.from_pretrained(TARGET, device="cuda", dtype=torch.bfloat16)
+# target_bf16_gpu: session fixture in conftest.py (shared with tests/test_1p5b.py since M14).
 
 
 def spec_run(target, draft, encode, prompts, k=4, max_num_seqs=1, cuda_graphs=None):

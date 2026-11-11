@@ -1,14 +1,31 @@
 """Prompt set loading and request building. Uses a fake tokenizer so these run without a download."""
-from bench.prompts import DEFAULT_PROMPTS_PATH, build_requests, load_prompt_set
+from bench.prompts import DEFAULT_PROMPTS_PATH, build_requests, load_prompt_set, shared_prefix_text
 
 
 class FakeTokenizer:
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
         assert tokenize is False and add_generation_prompt is True
-        return f"<user> {messages[0]['content']} </user> <assistant>"
+        return " ".join(f"<{m['role']}> {m['content']} </{m['role']}>" for m in messages) + " <assistant>"
 
     def __call__(self, text, add_special_tokens=False):
         return {"input_ids": text.split()}
+
+    def decode(self, ids):
+        return " ".join(ids)
+
+
+def test_shared_prefix_is_identical_in_every_request():
+    # M12 workload: one long system prompt shared by every request (where prefix caching pays off).
+    prompts = load_prompt_set(DEFAULT_PROMPTS_PATH)
+    tok = FakeTokenizer()
+    prefix = shared_prefix_text(tok, prompts, 300)
+    assert len(tok(prefix)["input_ids"]) == 300
+    reqs = build_requests(tok, prompts, 10, 16, seed=0, shared_prefix=prefix)
+    ids = [tok(r.prompt)["input_ids"] for r in reqs]
+    assert all(i[:302] == ids[0][:302] for i in ids)   # "<system>" + 300 words + "</system>"
+    assert len({r.prompt for r in reqs}) == 10 and all(r.prompt_tokens > 302 for r in reqs)
+    plain = build_requests(tok, prompts, 10, 16, seed=0)
+    assert [r.prompt.split("<user>")[1] for r in reqs] == [r.prompt.split("<user>")[1] for r in plain]
 
 
 def test_prompt_set_is_well_formed():

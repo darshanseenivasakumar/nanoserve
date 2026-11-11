@@ -15,7 +15,7 @@ import math
 
 import torch
 
-from nanoserve.kv_cache import BlockTable, ContiguousKVCache, PagedKVCache
+from nanoserve.kv_cache import BlockTable, ContiguousKVCache, PagedKVCache, PrefixCachingAllocator
 from nanoserve.model import DecodeMeta, ModelConfig, SeqInput
 
 
@@ -71,13 +71,20 @@ class PagedKVManager:
     kind = "paged"
 
     def __init__(self, cfg: ModelConfig, budget_tokens: int, block_size: int = 16, device="cuda",
-                 dtype=torch.bfloat16, watermark: float = 0.01, attn_backend: str = "sdpa"):
+                 dtype=torch.bfloat16, watermark: float = 0.01, attn_backend: str = "sdpa",
+                 prefix_caching: bool = False):
         """attn_backend: "sdpa" (M3: gather + SDPA per request) or "triton" (M4: one paged-attention
-        kernel launch per layer for all one-token decodes)."""
+        kernel launch per layer for all one-token decodes). prefix_caching (M12): reuse cached full blocks
+        of identical prefixes across requests."""
         self.pool = PagedKVCache.from_token_budget(cfg, budget_tokens, block_size, device, dtype)
         self.block_size = block_size
         self.device = device
         self.attn_backend = attn_backend
+        self.prefix_caching = prefix_caching
+        self.alloc = (PrefixCachingAllocator(self.pool.allocator, block_size) if prefix_caching
+                      else self.pool.allocator)
+        self.prefix_query_tokens = 0               # prompt tokens looked up at admission
+        self.prefix_hit_tokens = 0                 # ... of which were found in the cache (prefill skipped)
         # Keep a few blocks free at admission so a just-admitted request doesn't trigger an immediate
         # preemption on its first decode step (vLLM does the same).
         self.watermark_blocks = math.floor(watermark * self.pool.num_blocks)
@@ -85,33 +92,61 @@ class PagedKVManager:
 
     @property
     def num_free_blocks(self) -> int:
-        return self.pool.allocator.num_free
+        """Blocks available to new work (with prefix caching: truly free + cached-but-unreferenced)."""
+        return self.alloc.num_free
 
     def _blocks_for(self, n_tokens: int) -> int:
         return math.ceil(n_tokens / self.block_size)
+
+    def _hits(self, seq) -> list[int]:
+        """Cached blocks for the longest known prefix of this request, leaving >= 1 token to compute (we need
+        the logits of the last token)."""
+        if not self.prefix_caching:
+            return []
+        toks = seq.prompt_ids + seq.output_ids
+        return self.alloc.lookup(toks, max_blocks=(len(toks) - 1) // self.block_size)
+
+    def reset_stats(self) -> None:
+        self.prefix_query_tokens = self.prefix_hit_tokens = 0
 
     # --- scheduler interface ---
     def can_ever_fit(self, n_tokens: int) -> bool:
         return self._blocks_for(n_tokens) <= self.pool.num_blocks
 
     def can_admit(self, seq) -> bool:
-        need = self._blocks_for(seq.step_cost)
+        hits = self._hits(seq)
+        # Hit blocks need no new block, but hits that are parked in the evictable list stop counting as free.
+        pinned = sum(1 for b in hits if self.alloc.ref.get(b, 0) == 0)
+        need = self._blocks_for(seq.step_cost) - len(hits) + pinned
         return need <= self.num_free_blocks - self.watermark_blocks
 
     def admit(self, seq) -> None:
-        seq.block_table = BlockTable(self.block_size)
-        seq.block_table.reserve(seq.step_cost, self.pool.allocator)
+        table = BlockTable(self.block_size)
+        if self.prefix_caching:
+            hits = self._hits(seq)
+            self.prefix_query_tokens += seq.num_tokens
+            if hits:
+                # M12: start from the cached prefix: its K/V already exist, prefill only what follows.
+                self.alloc.pin(hits)
+                table.blocks = list(hits)
+                table.num_hashed = len(hits)
+                table.num_tokens = len(hits) * self.block_size
+                table.prefix_node = self.alloc.node_of[hits[-1]]
+                seq.num_cached = table.num_tokens
+                self.prefix_hit_tokens += table.num_tokens
+        seq.block_table = table
+        table.reserve(seq.step_cost, self.alloc)
 
     def try_append(self, seq) -> bool:
         """Reserve room for one more token (a decode step); False if the pool is out of blocks."""
         if seq.block_table.blocks_needed(1) > self.num_free_blocks:
             return False
-        seq.block_table.reserve(1, self.pool.allocator)
+        seq.block_table.reserve(1, self.alloc)
         return True
 
     def free(self, seq) -> None:
         if seq.block_table is not None:
-            seq.block_table.release(self.pool.allocator)
+            seq.block_table.release(self.alloc)
             seq.block_table = None
 
     # --- engine interface ---
@@ -155,7 +190,10 @@ class PagedKVManager:
         return self._slots, self._dec_tables, self._dec_lens
 
     def commit(self, seq, n_tokens: int) -> None:
-        seq.block_table.commit(n_tokens)
+        table = seq.block_table
+        table.commit(n_tokens)
+        if self.prefix_caching and table.num_tokens // self.block_size > table.num_hashed:
+            self.alloc.register(table, seq.prompt_ids + seq.output_ids)   # newly full blocks become reusable
 
     def usage(self, running) -> tuple[int, int]:
         """(tokens actually stored, tokens reserved = blocks held x block_size)."""

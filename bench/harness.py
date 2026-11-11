@@ -22,7 +22,7 @@ from pathlib import Path
 
 from bench.backends.base import Backend, Request, RequestRecord
 from bench.metrics import summarize
-from bench.prompts import DEFAULT_PROMPTS_PATH, build_requests, load_prompt_set
+from bench.prompts import DEFAULT_PROMPTS_PATH, build_requests, load_prompt_set, shared_prefix_text
 from bench.report import format_table
 
 RESULTS_DIR = Path(__file__).with_name("results")
@@ -108,7 +108,7 @@ def make_backend(args) -> Backend:
                                 kv_cache=args.kv_cache, block_size=args.block_size, attn_backend=args.attn_backend,
                                 draft_model=args.draft_model, num_speculative_tokens=args.num_speculative_tokens,
                                 cuda_graphs=args.cuda_graphs, piecewise_graphs=args.piecewise_graphs,
-                                fused_ops=args.fused_ops,
+                                fused_ops=args.fused_ops, prefix_caching=args.enable_prefix_caching,
                                 kv_cache_tokens=(int(args.kv_cache_gb * 2**30) // _kv_bytes_per_token(args)
                                                  if args.kv_cache_gb else None))
     from bench.backends.openai_http import OpenAIBackend
@@ -152,9 +152,14 @@ async def amain(args) -> int:
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.model)
     prompts = load_prompt_set(args.prompts)
     rng = args.output_len_range
-    requests = build_requests(tokenizer, prompts, args.num_prompts, args.max_tokens, args.seed, max_tokens_range=rng)
+    # M12: optional shared system prompt (the prefix-caching workload). Warm-up requests carry it too, so
+    # an engine with a prefix cache starts the measured run with the prefix cached (steady state).
+    shared = shared_prefix_text(tokenizer, prompts, args.shared_prefix_tokens) if args.shared_prefix_tokens else None
+    requests = build_requests(tokenizer, prompts, args.num_prompts, args.max_tokens, args.seed, max_tokens_range=rng,
+                              shared_prefix=shared)
     # Warmup uses a differently-shuffled draw so it doesn't pre-run the exact measured order.
-    warmup = (build_requests(tokenizer, prompts, args.warmup, args.max_tokens, args.seed + 1, max_tokens_range=rng)
+    warmup = (build_requests(tokenizer, prompts, args.warmup, args.max_tokens, args.seed + 1, max_tokens_range=rng,
+                             shared_prefix=shared)
               if args.warmup else [])
 
     backend = make_backend(args)
@@ -215,6 +220,10 @@ def parse_args(argv=None):
                    help="nanoserve: run mixed prefill+decode steps eagerly (M9 default: piecewise graphs)")
     p.add_argument("--no-fused-ops", dest="fused_ops", action="store_false", default=None,
                    help="nanoserve: unfused PyTorch ops (M10 default: fused Triton kernels)")
+    p.add_argument("--enable-prefix-caching", action="store_true",
+                   help="nanoserve: reuse cached KV blocks of shared prefixes (M12; off by default for fairness)")
+    p.add_argument("--shared-prefix-tokens", type=int, default=0,
+                   help="put the same N-token system prompt in front of every request (prefix-caching workload)")
     p.add_argument("--attn-backend", choices=["triton", "sdpa"], default=None,
                    help="nanoserve attention (default: triton kernel on GPU for the paged cache)")
     p.add_argument("--max-num-batched-tokens", type=int, default=2048, help="nanoserve: per-step token budget (M8 default)")

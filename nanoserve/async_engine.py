@@ -50,14 +50,15 @@ class AsyncEngine:
             self._thread.join(timeout=10)
             self._thread = None
 
-    async def generate(self, prompt_ids: list[int], max_new_tokens: int,
-                       ignore_eos: bool = False) -> AsyncIterator[tuple[int, float]]:
-        """Yield (token, timestamp) as the engine produces them."""
+    async def generate(self, prompt_ids: list[int], max_new_tokens: int, ignore_eos: bool = False,
+                       sampling=None) -> AsyncIterator[tuple[int, float]]:
+        """Yield (token, timestamp) as the engine produces them. sampling: SamplingParams (None = greedy)."""
         self._ensure_started()
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
         handle = {"seq_id": None, "done": False}       # the engine thread fills in seq_id
-        self._inbox.put(("add", list(prompt_ids), max_new_tokens, ignore_eos, loop, q, time.perf_counter(), handle))
+        self._inbox.put(("add", list(prompt_ids), max_new_tokens, ignore_eos, loop, q, time.perf_counter(), handle,
+                         sampling))
         try:
             while True:
                 item = await q.get()
@@ -91,9 +92,10 @@ class AsyncEngine:
                 del self._streams[sid]
                 self.num_aborted += 1
             return
-        _, prompt, max_new, ignore_eos, loop, q, t_arrival, handle = item
+        _, prompt, max_new, ignore_eos, loop, q, t_arrival, handle, sampling = item
         try:
-            sid = self.engine.add_request(prompt, max_new, ignore_eos=ignore_eos, arrival_time=t_arrival)
+            kw = {"sampling": sampling} if sampling is not None else {}
+            sid = self.engine.add_request(prompt, max_new, ignore_eos=ignore_eos, arrival_time=t_arrival, **kw)
         except Exception as e:
             self._send(loop, q, e)
             return

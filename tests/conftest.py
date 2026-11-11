@@ -62,3 +62,13 @@ def ours_bf16_gpu():
         pytest.skip("needs CUDA")
     from nanoserve.model import Qwen2Model
     return Qwen2Model.from_pretrained(MODEL, device="cuda", dtype=torch.bfloat16)
+
+
+@pytest.fixture(scope="session")
+def target_bf16_gpu():
+    """The 1.5B model in bf16 on the GPU, ONE copy for every `-m spec` test (M14: a second module-scoped copy
+    next to this one ran the 6 GB GPU out of memory)."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from nanoserve.model import Qwen2Model
+    return Qwen2Model.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct", device="cuda", dtype=torch.bfloat16)

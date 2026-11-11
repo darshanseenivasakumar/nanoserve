@@ -85,11 +85,22 @@ async def test_chat_streaming_format(served):
     assert content.strip()
 
 
-async def test_sampling_is_rejected_not_silently_ignored(served):
+async def test_sampling_is_honoured_and_unsupported_params_rejected(served):
+    # M13 (changed from M6's "temperature 0.7 -> 400", which held while nanoserve was greedy-only).
     app, _, _ = served
+    body = {"model": MODEL, "prompt": "Write a short poem about rain.", "max_tokens": 24, "temperature": 1.0,
+            "top_p": 0.95, "seed": 7}
     async with client(app) as c:
-        r = await c.post("/v1/completions", json={"model": MODEL, "prompt": "hi", "temperature": 0.7})
-        assert r.status_code == 400
+        text = lambda r: r.json()["choices"][0]["text"]                       # noqa: E731
+        a = text(await c.post("/v1/completions", json=body))
+        b = text(await c.post("/v1/completions", json=body))
+        greedy = text(await c.post("/v1/completions", json={**body, "temperature": 0}))
+        other = text(await c.post("/v1/completions", json={**body, "seed": 8}))
+        assert a == b                              # same seed -> same text
+        assert a != greedy or a != other           # ... and it really sampled
+        for bad in ({"temperature": -1}, {"top_p": 0}, {"top_k": -5}, {"presence_penalty": 0.5}, {"n": 2}):
+            r = await c.post("/v1/completions", json={**body, **bad})
+            assert r.status_code == 400, bad
         r = await c.post("/v1/completions", json={"model": MODEL, "prompt": "hi", "presence_penalty": 0})
         assert r.status_code == 200                # neutral defaults are fine
 

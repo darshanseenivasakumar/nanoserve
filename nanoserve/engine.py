@@ -17,6 +17,7 @@ Known costs accepted for now:
 from __future__ import annotations
 
 import json
+import random
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ import torch
 
 from nanoserve.kv_manager import ContiguousKVManager, PagedKVManager
 from nanoserve.model import Qwen2Model, _snapshot
+from nanoserve.sampling import SamplingParams, sample
 from nanoserve.scheduler import Scheduler, Sequence
 
 
@@ -61,7 +63,7 @@ class LLMEngine:
                  batch_wait_s: float = 0.02, kv_cache: str = "paged", kv_cache_tokens: int | None = None,
                  block_size: int = 16, attn_backend: str | None = None, cuda_graphs: bool | None = None,
                  chunked_prefill: bool | None = None, piecewise_graphs: bool | None = None,
-                 fused_ops: bool | None = None):
+                 fused_ops: bool | None = None, prefix_caching: bool = False):
         """kv_cache: "paged" (M3, default) or "contiguous" (M1/M2). kv_cache_tokens: the explicit KV budget
         in tokens (default 32 x max_seq_len)."""
         self.eos_token_ids = list(eos_token_ids)
@@ -80,8 +82,9 @@ class LLMEngine:
             model = model.with_fused_ops()
         self.model = model
         if kv_cache == "paged":
+            # M12: prefix caching is opt-in (the main benchmark keeps it off for every engine).
             self.kv = PagedKVManager(model.cfg, budget, block_size, device=model.device, dtype=model.dtype,
-                                     attn_backend=attn_backend)
+                                     attn_backend=attn_backend, prefix_caching=prefix_caching)
             if chunked_prefill is None:
                 chunked_prefill = True               # M8 default for the paged cache
             if not chunked_prefill:
@@ -89,6 +92,8 @@ class LLMEngine:
                 # tokens) in ONE step, so the budget can't be smaller than that.
                 max_num_batched_tokens = max(max_num_batched_tokens, max_seq_len)
         elif kv_cache == "contiguous":
+            if prefix_caching:
+                raise ValueError("prefix caching shares paged blocks: it needs kv_cache='paged'")
             self.kv = ContiguousKVManager(model.cfg, max_seq_len, budget, device=model.device, dtype=model.dtype)
         else:
             raise ValueError(f"unknown kv_cache {kv_cache!r}")
@@ -125,6 +130,8 @@ class LLMEngine:
         for k in self._stats:
             self._stats[k] = 0.0 if isinstance(self._stats[k], float) else 0
         self.scheduler.num_preemptions = 0
+        if hasattr(self.kv, "reset_stats"):
+            self.kv.reset_stats()
 
     @property
     def stats(self) -> dict:
@@ -138,6 +145,9 @@ class LLMEngine:
         s["graph_buckets"] = self.graph_runner.captured_buckets if self.graph_runner else []
         s["piecewise_graphs"] = self.piecewise_runner is not None
         s["fused_ops"] = self.model.fused
+        s["prefix_caching"] = getattr(self.kv, "prefix_caching", False)
+        s["prefix_query_tokens"] = getattr(self.kv, "prefix_query_tokens", 0)
+        s["prefix_hit_tokens"] = getattr(self.kv, "prefix_hit_tokens", 0)
         s["piecewise_buckets"] = self.piecewise_runner.captured_buckets if self.piecewise_runner else []
         return s
 
@@ -159,13 +169,15 @@ class LLMEngine:
                    eos_token_ids=load_eos_token_ids(name), **kwargs)
 
     def add_request(self, prompt_ids: list[int], max_new_tokens: int, ignore_eos: bool = False,
-                    arrival_time: float | None = None) -> int:
+                    arrival_time: float | None = None, sampling: SamplingParams | None = None) -> int:
         if len(prompt_ids) + max_new_tokens > self.max_seq_len:
             raise ValueError(f"prompt ({len(prompt_ids)}) + max_new_tokens ({max_new_tokens}) "
                              f"exceeds max_seq_len ({self.max_seq_len})")
+        seed = sampling.seed if (sampling is not None and sampling.seed is not None) else random.getrandbits(62)
         seq = Sequence(seq_id=self._next_id, prompt_ids=list(prompt_ids), max_new_tokens=max_new_tokens,
                        ignore_eos=ignore_eos,
-                       arrival_time=time.perf_counter() if arrival_time is None else arrival_time)
+                       arrival_time=time.perf_counter() if arrival_time is None else arrival_time,
+                       sampling=sampling, seed=seed)
         self.scheduler.add(seq)   # may raise (prompt longer than the token budget)
         self.sequences[seq.seq_id] = seq
         self._next_id += 1
@@ -218,7 +230,13 @@ class LLMEngine:
             logits = m.forward_batch(torch.tensor(tokens, device=m.device), torch.tensor(positions, device=m.device),
                                      inputs, logits="last", **self.kv.forward_kwargs())
         self._mark("launch", gpu_end=True)
-        next_tokens = logits.argmax(-1).tolist()      # greedy; one sync for the whole batch
+        if any(s.sampling is not None and not s.sampling.greedy for s in plan.scheduled):
+            # M13: draw n of request r uses mix(seed_r, n), n = tokens generated so far -> reproducible
+            # whatever the batch, and across a preemption + recompute.
+            next_tokens = sample(logits, [s.sampling for s in plan.scheduled], [s.seed for s in plan.scheduled],
+                                 [len(s.output_ids) for s in plan.scheduled])
+        else:
+            next_tokens = logits.argmax(-1).tolist()      # greedy; one sync for the whole batch
         self._mark("wait")
 
         for seq, n in zip(plan.scheduled, counts):

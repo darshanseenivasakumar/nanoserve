@@ -96,8 +96,11 @@ async def test_server_on_top_of_the_engine_process(proc, tokenizer):
     assert r.status_code == 200 and r.json()["usage"]["completion_tokens"] <= 8
 
 
-def test_close_stops_the_child():
-    ep = EngineProcess(EngineSpec(**SPEC))
-    assert ep.is_alive()
-    ep.close()
-    assert not ep.is_alive()
+def test_close_stops_the_child(proc):
+    # Last test of the module: closes the shared child (the fixture's close() afterwards is a no-op).
+    # Spawning a SECOND child here failed once inside the full suite (two CUDA contexts + models next to
+    # every other fixture's GPU memory) while passing alone.
+    assert proc.is_alive()
+    proc.close()
+    assert not proc.is_alive()
+    proc.close()                                            # idempotent

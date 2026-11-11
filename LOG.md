@@ -744,3 +744,117 @@ Median TTFT below vLLM's at every load measured; p99 TTFT below vLLM's everywher
 vs 137 ms, equal within noise) -- cause of our lower TTFT still not investigated (flagged since M10).
 - The "thread" rows reproduce M10's server within 1-2% (c=32 1742 vs 1769): a normal session.
 - Remaining per-token gap ~10% (TPOT p50 8.7 vs 7.9 at c=1, 12.7 vs 11.4 at c=32).
+
+## 2026-11-11 — M12 plan: automatic prefix caching (user: "continue to the next phase")
+Why: real traffic repeats prefixes (a long system prompt, a shared document, earlier chat turns). Today
+every request recomputes them. vLLM's APC / SGLang's RadixAttention keep the KV of FULL blocks and hand
+them to later requests with the same prefix: that part of the prefill is skipped.
+
+Design (PrefixCachingAllocator in kv_cache.py, used by PagedKVManager when prefix_caching=True):
+- Reference counts per block: a cached block can be in several block tables at once.
+- Exact prefix keys, no hash collisions: key(block i) = (node id of block i-1's key, the 16 token ids);
+  every registered key gets a fresh node id (a trie / radix-tree flavour). Lookup walks from the root.
+- A block is registered when it becomes FULL (prefill or decode); partial blocks are never shared, and a
+  request never writes into a block it got from the cache (it only writes after its cached tokens).
+- Freed blocks that are registered go to an LRU "evictable" list instead of the free list (tail blocks of
+  a request first); allocation takes truly free blocks first, then evicts the LRU cached block.
+- Admission: longest cached prefix of prompt (+ outputs, after a preemption), capped so >= 1 token is
+  computed (we need its logits); num_cached starts at the hit length; the rest is an ordinary chunked
+  prefill on top of a context (M8 code path). Capacity = free + evictable, minus evictable blocks the hit
+  pins. The scheduler admits before sizing the chunk (hits shrink it).
+- Off by default (the main benchmark keeps prefix caching off for every engine); --enable-prefix-caching
+  on server and harness; vLLM via PREFIX_CACHING=1.
+Gates (tests first): allocator units (refcounts, exact-prefix lookup, LRU eviction, duplicate
+registration, no double free); fp32 strict: prefix caching on vs off token-identical on a shared-prefix
+workload, also under eviction + preemption, no leaked blocks; repeated prompt hits floor((len-1)/16)
+blocks; bf16 GPU fast path (graphs + piecewise + fused) vs off: tie rule.
+Benchmark: new workload = a ~1000-token shared system prompt + the 64 prompts; nanoserve and vLLM, each
+with prefix caching off and on, same session.
+
+M12 code: PrefixCachingAllocator (kv_cache.py: refcounts, exact trie keys (parent node id, 16 token ids),
+LRU evictable list, register-on-full); BlockTable gained num_hashed / prefix_node; PagedKVManager
+(prefix_caching=True): lookup at can_admit/admit capped at (len-1)//16 blocks, pin hits, start num_cached
+at the hit, register newly full blocks at commit (only when a block boundary was crossed); Scheduler admits
+BEFORE sizing the chunk; LLMEngine(prefix_caching=False) + stats prefix_hit_tokens / prefix_query_tokens;
+flags: server --enable-prefix-caching, harness --enable-prefix-caching and --shared-prefix-tokens N
+(bench/prompts.py shared_prefix_text: the "long" prompts' paragraphs cut to N tokens, as a system
+message); bench/servers/vllm.sh PREFIX_CACHING=1.
+Tests (12 new): 6 allocator units (exact prefix lookup, different prefix = miss, freed cached blocks are
+evictable + reusable, LRU eviction order, duplicate registration, double free); fp32 strict on a
+shared-prefix workload (long-00 paragraph as system prompt + 6 questions, 3 waves): prefix caching on vs
+off token-identical, 2320 of 3802 prompt tokens (61%) served from the cache, no leaked blocks; tight pool
+(evictions + 1 preemption): identical, no leaks; repeated prompt hits exactly (len-1)//16*16 tokens;
+bf16 fast path (graphs + piecewise + fused): 4/6 identical, 2 divergences at ties (gaps 0.000, 0.125);
+prefix caching with the contiguous cache is rejected; shared-prefix prompts are identical up to the prefix.
+Tests: 164 default + 7 spec passed.
+
+M12 benchmark (bench/runs/m12_bench.sh; harness --shared-prefix-tokens 1024: the same 1024-token system
+prompt + each of the 64 prompts, 1235 prompt tokens on average, fixed 128 out; servers; one session):
+| c | nanoserve off | nanoserve ON | vLLM off | vLLM ON | TTFT p50/p99 ns off | ns ON | vLLM off | vLLM ON |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 88.6 | 95.7 | 127.5 | 104.3 | 90/125 | 23/47 | 86/118 | 39/86 |
+| 4 | 294.4 | 356.2 | 371.3 | 362.0 | 172/351 | 46/125 | 257/390 | 60/80 |
+| 8 | 480.3 | 734.0 | 612.5 | 663.4 | 221/727 | 52/111 | 350/579 | 87/136 |
+| 16 | 707.4 | 1339.7 | 860.2 | 1278.0 | 365/1370 | 127/221 | 492/1173 | 136/261 |
+| 32 | 921.8 | 2181.9 | 1018.7 | 2063.1 | 445/2765 | 357/379 | 775/2452 | 209/261 |
+TPOT p50 c=32: nanoserve off 31.3 -> on 11.8 ms; vLLM off 25.7 -> on 13.6 ms.
+=> Prefix caching: nanoserve 2.37x at c=32 (+53% at c=8), p99 TTFT 2765 -> 379 ms. With caching on for
+both, nanoserve is 92-98% of vLLM at c=1-4 and 105-111% at c=8-32.
+- FLAG (unexplained): vLLM with prefix caching was SLOWER at c=1 (127.5 -> 104.3 tok/s, TPOT 7.1 -> 9.4 ms)
+  and about equal at c=4. Not investigated (session noise or a real per-step cost in vLLM).
+- FLAG: at c=32 vLLM's TTFT is better with caching (209 vs our 357 ms p50). Not investigated.
+- Without caching on this long-prompt workload nanoserve is 69% (c=1) to 90% (c=32) of vLLM; its TPOT at
+  c=32 is 31 ms because each step carries a lot of prefill compute.
+- PROCESS FLAG: I wired M13 into shared files (engine, server, scheduler, engine_process) before committing
+  M12 (the M12 benchmark was still running), so M12 and M13 share one commit instead of two.
+
+## 2026-11-11 — M13 plan: sampling (user: "continue to the next phase and finish all the phases")
+Until now nanoserve is greedy-only (the server rejects temperature > 0 with HTTP 400). Real chat uses
+sampling. Plan:
+- SamplingParams(temperature=0, top_p=1, top_k=0 (off), seed=None), validated. temperature 0 = greedy,
+  and an all-greedy batch keeps the exact old argmax path (every existing gate unchanged).
+- Sampled rows: logits / temperature (fp32) -> top-k mask -> top-p mask (sort; keep the smallest set whose
+  probability reaches p; always keep the top token) -> GUMBEL-MAX: argmax(x + g), g = -log(-log(u)),
+  which samples exactly from softmax(x).
+- Per-request randomness: u for request r's n-th generated token comes from its own generator seeded with
+  mix(seed_r, n). So a request's samples don't depend on which other requests share its batch, or on a
+  preemption + recompute (same n -> same draw). Unseeded requests get a random seed at add_request.
+- API: add_request(..., sampling=...), AsyncEngine / EngineProcess pass it through; the server accepts
+  temperature / top_p / top_k / seed and still rejects what it doesn't implement (n > 1, penalties,
+  logprobs). FLAG (rule 6): the M6 server test asserting "temperature 0.7 -> 400" changes to assert that
+  sampling parameters are honoured; unsupported parameters stay rejected.
+- Speculative engine stays greedy (rejects sampling).
+Gates: statistical tests vs exact softmax probabilities (temperature, top-k, top-p; 20k draws); same
+seed + step -> same token whatever the batch; temperature 0 == argmax; engine: seeded sampling
+reproducible across runs and batch compositions, different seeds differ; server honours parameters.
+
+M13 code: nanoserve/sampling.py (SamplingParams, mix_seed = splitmix64(seed, step), sample(): temperature,
+top-k, top-p (sorted, keep the smallest set reaching p, top token always kept), Gumbel-max with a
+per-request torch.Generator per draw); Sequence.sampling / .seed; LLMEngine.add_request(sampling=...)
+(seed drawn at random when not given); step() uses sample() only if some row samples (all-greedy batches
+keep the old argmax line); AsyncEngine / EngineProcess pass sampling through; SpeculativeEngine rejects
+non-greedy sampling; server parses temperature / top_p / top_k (-1 or 0 = off) / seed and still rejects
+penalties, n > 1, logprobs, stop. An omitted temperature means greedy (OpenAI default 1.0; deliberate).
+Tests (11 new + 1 changed): frequencies over 20k draws within 0.015 of exact softmax for T = 0.5/1/2,
+top-k=2, top-p=0.7; greedy rows untouched in mixed batches; same (seed, step) = same token whatever the
+batch; different seeds differ; invalid params rejected; engine (fp32): seeded output identical across two
+runs AND one-at-a-time vs batched; identical across a preemption + recompute (22-block pool); T=0 ==
+greedy; different seeds change the text. FLAG (rule 6): tests/test_server.py's M6 test "temperature 0.7 ->
+400" became "sampling honoured (same seed = same text) + unsupported params still 400". First version of
+the preemption test used a 420-token pool and did not preempt (27 blocks hold all 4 requests unless
+none stops early); fixed to 352 tokens after measuring the prompts (43/47/182/45 tokens).
+Tests: 175 default + 8 spec passed (spec now includes M14's 1.5B fast-path test).
+- FAILED first (memory, again): the first full run after M13 died with WSL restarting (uptime 0) during the
+  spec suite. Then, alone, the spec suite hit CUDA OOM: test_1p5b.py loaded a SECOND bf16 1.5B copy on the
+  6 GB GPU next to test_speculative.py's module fixture. Fix: one session-scoped target_bf16_gpu fixture in
+  conftest.py shared by both files. Spec session peak RSS 11.41 GB (cap 11 GB + swap): still the flagged
+  pre-existing risk; raising `memory=` in .wslconfig is the user's call.
+- test_engine_process.py::test_close_stops_the_child failed once inside the full suite (RuntimeError while
+  spawning a second engine child) but passed alone; it now closes the module's shared child instead of
+  spawning another (also checks close() is idempotent). Root cause of the spawn failure not pinned down
+  (most likely GPU memory with every other fixture loaded).
+- M14 1.5B fast path (fused + graphs + piecewise + Triton attention) vs the unfused single-request reference:
+  2/4 identical; divergences at gaps 0.125 (medium-04, token 15) and 0.250 (long-00, token 0).
+  FLAG: 0.250 is exactly at the tie-rule limit (<= 0.25), accepted by the rule but with no margin.
+- 1.5B fp16 GGUF downloaded (resumed after the WSL restart) and verified: 3,560,416,288 bytes = the size in
+  the HF tree listing, GGUF magic present.

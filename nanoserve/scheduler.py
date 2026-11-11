@@ -41,6 +41,8 @@ class Sequence:
     cache: object | None = None        # contiguous KV cache (M1/M2), set on admission
     block_table: object | None = None  # paged KV (M3), set on admission
     num_cached: int = 0                # tokens whose K/V are stored. 0 => this sequence must (re)prefill.
+    sampling: object | None = None     # M13: SamplingParams (None = greedy)
+    seed: int = 0                      # M13: this request's random stream (draw n uses mix(seed, n))
 
     @property
     def num_tokens(self) -> int:
@@ -184,10 +186,12 @@ class Scheduler:
                    and (budget > 0 if self.chunked_prefill else self.waiting[0].step_cost <= budget)
                    and (self.kv is None or self.kv.can_admit(self.waiting[0]))):
                 seq = self.waiting.popleft()
+                if self.kv is not None:
+                    # Reserves KV for ALL of its known tokens; with prefix caching (M12) it may start from
+                    # cached blocks, so admit BEFORE sizing the chunk (num_cached can jump ahead).
+                    self.kv.admit(seq)
                 n = min(seq.step_cost, budget) if self.chunked_prefill else seq.step_cost
                 budget -= n
-                if self.kv is not None:
-                    self.kv.admit(seq)             # reserves KV for ALL of its known tokens
                 seq.status = SeqStatus.RUNNING
                 admitted.append(seq)
                 scheduled.append(seq)

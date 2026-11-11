@@ -277,6 +277,30 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
 - **Profile disproves hypothesis**: M11 planned to overlap scheduling with GPU work; the profile showed
   scheduling cost 0.25 ms of a 14.9 ms step, and the real loss was GIL sharing with the HTTP thread.
 
+## Prefix caching (M12)
+- **Prefix caching (vLLM: automatic prefix caching, APC)**: keep the KV blocks of prompts after a request
+  ends; a later request whose prompt starts with the same tokens reuses them and only prefills the rest.
+  Pays off for long shared system prompts, a shared document, few-shot examples, multi-turn chats.
+- **Block key / trie**: a full block is identified by (its prefix's key, its own token ids), so equal tokens
+  after a different prefix never match. Keys form a tree of prefixes (SGLang calls its version a radix tree).
+- **Reference count**: how many requests currently use a block. Shared blocks are freed only at zero.
+- **Evictable (LRU)**: a cached block nobody uses stays in memory, counted as free capacity, until space is
+  needed; then the least recently freed one is reused (its cache entry dropped).
+- **Hit rate**: prompt tokens found in the cache / prompt tokens looked up.
+- **Copy-on-write (not needed here)**: a shared block must never be modified. Here only FULL blocks are
+  shared and a request writes only after its cached prefix, so no block is ever written while shared.
+
+## Sampling (M13)
+- **Temperature**: divides the logits before softmax. 0 = greedy (always the top token), 1 = the model's own
+  distribution, >1 = flatter / more random, <1 = sharper.
+- **Top-k**: sample only among the k highest-scoring tokens (renormalised).
+- **Top-p (nucleus)**: sample only among the smallest set of top tokens whose probabilities add up to p.
+- **Gumbel-max trick**: argmax(logits + g) with g = -log(-log(u)), u uniform, is an exact sample from
+  softmax(logits): no cumulative sums needed.
+- **Per-request seed**: each request has its own random stream; the n-th draw uses (seed, n), so the same
+  seed gives the same text whatever else is in the batch, even after a preemption + recompute.
+- **splitmix64**: a tiny integer mixing function used to turn (seed, step) into well-spread generator seeds.
+
 ## Tooling
 - **uv**: a fast Python package/project manager. `uv sync` installs exactly what `pyproject.toml`/`uv.lock` say.
 - **venv (virtual environment)**: an isolated folder of Python packages. vLLM gets its own because it pins a

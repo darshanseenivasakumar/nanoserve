@@ -1,8 +1,9 @@
 # nanoserve
 
 A mini LLM inference engine built from scratch to learn ML infrastructure: **continuous batching**, a
-**paged KV cache**, a **Triton paged-attention kernel**, **speculative decoding**, and an
-**OpenAI-compatible streaming server**. Benchmarked honestly against vLLM and llama.cpp, with every
+**paged KV cache** with **prefix caching**, **Triton kernels** (paged attention + fused ops), **CUDA graphs**,
+**chunked prefill**, **speculative decoding**, **sampling**, and an **OpenAI-compatible streaming server**
+whose GPU loop runs in its own process. Benchmarked honestly against vLLM and llama.cpp, with every
 stage gated on matching HuggingFace's outputs.
 
 Development hardware: an RTX 3050 6 GB *laptop* GPU under WSL2, Qwen2.5-0.5B-Instruct (and 1.5B for
@@ -60,6 +61,22 @@ run). Other nanoserve rows are from earlier sessions.
 | vLLM 0.33.0 (M11 session) | 449.1 | 781.0 | 1316.4 | 1778.3 | 64 / 244 ms |
 | **nanoserve M11 / vLLM** | **89%** | **90%** | **91%** | **94%** | |
 
+**Shared 1,024-token system prompt (prefix caching, M12)** — the same system prompt in front of all 64
+prompts (1,235 prompt tokens on average), fixed 128 output tokens, prefix caching OFF vs ON for both
+engines, one session. Output tokens/s and TTFT p50 / p99:
+
+| c | nanoserve off | **nanoserve on** | vLLM off | vLLM on | TTFT nanoserve on | TTFT vLLM on |
+|---|---|---|---|---|---|---|
+| 1 | 88.6 | **95.7** | 127.5 | 104.3 | **23** / 47 ms | 39 / 86 ms |
+| 4 | 294.4 | **356.2** | 371.3 | 362.0 | **46** / 125 ms | 60 / 80 ms |
+| 8 | 480.3 | **734.0** | 612.5 | 663.4 | **52 / 111** ms | 87 / 136 ms |
+| 16 | 707.4 | **1339.7** | 860.2 | 1278.0 | **127 / 221** ms | 136 / 261 ms |
+| 32 | 921.8 | **2181.9** | 1018.7 | 2063.1 | 357 / 379 ms | **209 / 261** ms |
+
+With a shared prefix, prefix caching is worth **2.4x** throughput at c=32 for nanoserve (and cuts p99 TTFT
+from 2.8 s to 0.38 s); with it on, nanoserve is at 92-98% of vLLM up to c=4 and **ahead from c=8**
+(105-111%). vLLM's median TTFT is better at c=32. Unexplained: vLLM got slower at c=1 with its cache on.
+
 ![fixed-length results](bench/plots/m11-proc-on.png)
 ![varied-length results](bench/plots/m11-proc-on-var16-256.png)
 
@@ -71,7 +88,7 @@ llama.cpp's best configuration from c=8 up. Time per token is 8.7–13.8 ms vs v
 
 ```
  HTTP client ──SSE──▶ nanoserve/server.py (FastAPI)          /v1/completions, /v1/chat/completions
-                         │  tokenize, validate (greedy only), incremental detokenize, abort on disconnect
+                         │  tokenize, validate, sampling params, incremental detokenize, abort on disconnect
                          ▼                   ── API process ──────────────────────────────────────────────
                  nanoserve/engine_process.py  (M11) pipe: requests in, ONE message of tokens per step out;
                          │                   a reader thread wakes each event loop once per step
@@ -82,13 +99,14 @@ llama.cpp's best configuration from c=8 up. Time per token is 8.7–13.8 ms vs v
      ▼                   ▼                                             ▼
  scheduler.py        kv_manager.py / kv_cache.py                   model.py  forward_batch()
  continuous batching  paged pool [blocks,16,kv_heads,dim]           Qwen2 from scratch (plain tensors)
- FCFS admission by    block tables, free list, slot mapping         selective batching: token-wise layers
+ FCFS admission by    block tables, slot map; M12 prefix cache      selective batching: token-wise layers
  seats + token budget explicit KV budget; contiguous mode kept      over ALL tokens at once; attention per
  + KV blocks          for A/B comparison                            request:
  LIFO preemption with                                                 prefill / multi-token -> SDPA
  recompute                                                            decode -> kernels/paged_attention.py
                                                                       (Triton, 1 launch per layer)
-                                                                   greedy argmax, 1 GPU->CPU sync / step
+                                                                   greedy argmax or seeded sampling (M13),
+                                                                   1 GPU->CPU sync / step
                                                                    pure-decode steps: replay a CUDA graph
                                                                    (cuda_graphs.py, one per batch bucket)
                                                                    mixed steps <= 512 tokens: 25 graph
@@ -116,6 +134,8 @@ llama.cpp's best configuration from c=8 up. Time per token is 8.7–13.8 ms vs v
 | M9 | Piecewise CUDA graphs for mixed prefill+decode steps (everything but attention graphed per token bucket); ITL metric | piecewise step **bitwise** = eager; small mixed step **37 → 13 ms**; TTFT p50 c=1 **34 → 26 ms**, c=4 91 → 59; varied lengths +3–7% tok/s; fixed a capture memory leak (−190 MiB) |
 | M10 | Operator fusion in Triton (RMSNorm + residual add, RoPE + KV write, SiLU×mul) + merged QKV and gate/up GEMMs | kernels **bitwise** = the PyTorch ops; **1,052 → 325 kernels/step**; decode step 10.3 → 8.4 ms, 2048-token prefill 166 → 131 ms; **+14–16% tok/s at every load: 78–89% of vLLM** |
 | M11 | Profile the loop under load, then move the engine into its own process (API server / engine core split) | scheduling was only 0.25 ms of a 14.9 ms step (GPU 95% busy) — the loss was GIL sharing with the HTTP thread (server −22% vs bare loop); tokens **bitwise** = in-thread engine; **+3% (c=1) to +21% (c=32): 89–94% of vLLM** |
+| M12 | Automatic prefix caching: refcounted blocks, exact-prefix trie keys, LRU eviction | fp32 tokens identical with/without (also under eviction + preemption); shared 1,024-token prompt: **2.4x tok/s at c=32**, p99 TTFT 2.8 s → 0.38 s; **ahead of vLLM (also caching) from c=8** |
+| M13 | Sampling: temperature / top-k / top-p, Gumbel-max, per-request seeded randomness | draws match exact softmax probabilities (20k-draw tests); a seed reproduces the same text whatever the batch and across preemption; temperature 0 = the old greedy path |
 
 Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every term: [`GLOSSARY.md`](GLOSSARY.md).
 
@@ -138,7 +158,11 @@ Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every t
   the HF-exact reference.
 - **Engine process**: tokens **bitwise** identical to the same engine run as a thread (same kernels, same
   inputs), with EOS stopping, aborts freeing KV in the child, and errors crossing the process boundary.
-- 159 tests (`uv run pytest`: 152, plus `uv run pytest -m spec`: 7 speculative tests on the 1.5B model).
+- **Prefix caching**: with vs without, fp32 tokens identical on a shared-prefix workload, including under
+  eviction and preemption, with no leaked blocks; bf16 fast path under the tie rule.
+- **Sampling**: statistical tests against exact softmax probabilities (temperature, top-k, top-p); seeded
+  output identical across runs, batch compositions and preemption + recompute.
+- 183 tests (`uv run pytest`: 175, plus `uv run pytest -m spec`: 8 on the 1.5B model).
 
 ## Where we lose, and why (honest section)
 
@@ -183,9 +207,11 @@ Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every t
 6. **llama.cpp depends on its configuration.** Its 8-slot config was 2.3x faster than nanoserve M6 at c=8;
    nanoserve M7 now beats it there (554 vs 486 tok/s; varied 504 vs 392). Its per-token cost drops when the
    slot count matches the load; ours needs no tuning.
-7. **Not implemented:** graphs for steps above 512 tokens, fusing elementwise ops INTO the GEMMs, prefix caching,
-   swap-to-CPU preemption, sampling (greedy only), quantization, tensor parallelism, split-K decode for long
-   contexts. Speculative engine: reserves KV for prompt + max_new up front (no preemption), fixed k (no
+7. **Not implemented:** graphs for steps above 512 tokens, fusing elementwise ops INTO the GEMMs,
+   swap-to-CPU preemption, stop strings / penalties / logprobs, quantization, tensor parallelism, split-K
+   decode for long contexts. An omitted `temperature` means greedy (OpenAI's default would be 1.0: chosen so
+   the default is deterministic). Speculative decoding is greedy-only (sampling would need rejection
+   sampling). Speculative engine: reserves KV for prompt + max_new up front (no preemption), fixed k (no
    adaptive lookahead), eager prefills.
 8. **CUDA-graph caveats.** Decode: one graph per batch bucket (1, 2, 4, ..., 128). Mixed: 25 pieces per
    token bucket (every 16 tokens to 256, every 32 to 512) = 600 graphs. The server captures all of them
@@ -215,6 +241,8 @@ Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every t
   (ITL p99 154 → 49 ms) while the mean stays put.
 - Serving layer at c=32: bare engine loop 2,150 tok/s, same engine behind an HTTP server in one process
   1,681 (−22%, GIL), engine in its own process **2,020–2,110**.
+- Prefix caching with a shared 1,024-token prompt at c=32: **922 → 2,182 tok/s**, p99 TTFT 2,765 → 379 ms;
+  the cache skips ~83% of each prompt's prefill.
 - Fusion: **1,052 → 325 kernels** per decode step. Unfused RMSNorm/RoPE/SiLU moved ~7.4 GB per 2048-token
   prefill (≈ 46 ms at ~168 GB/s, measured 46); fused: −35 ms. End to end **+14–16% tok/s**.
 
@@ -222,7 +250,7 @@ Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every t
 
 ```bash
 uv sync
-uv run pytest                      # 152 tests (GPU + model download)
+uv run pytest                      # 175 tests (GPU + model download)
 uv run pytest -m spec              # 7 speculative-decoding tests (1.5B model, ~8 GB RAM)
 
 # in-process engine
@@ -237,6 +265,8 @@ bash bench/servers/vllm.sh                       # vLLM in its own venv (~/envs/
 bash bench/servers/build_llamacpp.sh && bash bench/servers/llamacpp.sh
 
 bash bench/runs/m11_bench.sh && uv run python -m bench.plot --tag m11-proc-on,m11-proc-off,m11-vllm-control,m6
+bash bench/runs/m12_bench.sh                       # shared-prefix workload, prefix caching off/on, + vLLM
+# sampling: POST /v1/completions with "temperature": 0.8, "top_p": 0.95, "seed": 1
 uv run python -m bench.runs.m11_loop_profile       # step-loop phases + GPU busy time, bare vs AsyncEngine
 uv run python -m bench.runs.m10_profile            # where GPU time goes, by kernel category
 uv run python -m bench.runs.m10_step_probe         # one step: unfused vs fused

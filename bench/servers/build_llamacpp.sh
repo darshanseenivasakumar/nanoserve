@@ -23,11 +23,15 @@ cmake --build "$SRC/build" --config Release -j"$(nproc)" --target llama-server
 "$SRC/build/bin/llama-server" --version
 
 # f16 GGUF of the same model (same precision class as bf16 HF/vLLM; NOT a 4-bit quant).
+# GGUF_FILE may list several space-separated parts: bigger GGUFs are split (verified 2026-11-11: the 3B fp16
+# is qwen2.5-3b-instruct-fp16-00001-of-00002.gguf + -00002-of-00002.gguf). Point llama-server at part 1.
 MODELS="${MODELS_DIR:-$HOME/models}"
 mkdir -p "$MODELS"
 GGUF_REPO="${GGUF_REPO:-Qwen/Qwen2.5-0.5B-Instruct-GGUF}"
 GGUF_FILE="${GGUF_FILE:-qwen2.5-0.5b-instruct-fp16.gguf}"
-if [ ! -f "$MODELS/$GGUF_FILE" ]; then
-  curl -L --fail -sS -o "$MODELS/$GGUF_FILE" "https://huggingface.co/$GGUF_REPO/resolve/main/$GGUF_FILE"
-fi
-ls -lh "$MODELS/$GGUF_FILE"
+for f in $GGUF_FILE; do
+  if [ ! -f "$MODELS/$f" ]; then
+    curl -L --fail -sS -o "$MODELS/$f" "https://huggingface.co/$GGUF_REPO/resolve/main/$f"
+  fi
+  ls -lh "$MODELS/$f"
+done

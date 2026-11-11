@@ -40,6 +40,7 @@ class EngineSpec:
     cuda_graphs: bool | None = None
     piecewise_graphs: bool | None = None
     fused_ops: bool | None = None
+    prefix_caching: bool = False
     draft_model: str | None = None
     num_speculative_tokens: int = 4
     capture_graphs: bool = True        # capture every CUDA graph before serving (server); tests skip it
@@ -67,7 +68,7 @@ def build_engine(spec: EngineSpec):
                      max_num_batched_tokens=spec.max_num_batched_tokens, kv_cache="paged",
                      kv_cache_tokens=spec.kv_cache_tokens, attn_backend=spec.attn_backend,
                      cuda_graphs=spec.cuda_graphs, piecewise_graphs=spec.piecewise_graphs,
-                     fused_ops=spec.fused_ops)
+                     fused_ops=spec.fused_ops, prefix_caching=spec.prefix_caching)
 
 
 # ---------------------------------------------------------------------------------------- child process
@@ -111,9 +112,10 @@ def _child_main(spec: EngineSpec, req_conn, out_conn) -> None:
                 msg = req_conn.recv()
                 kind = msg[0]
                 if kind == "add":
-                    _, rid, prompt, max_new, ignore_eos, t_arrival = msg
+                    _, rid, prompt, max_new, ignore_eos, t_arrival, sampling = msg
                     try:
-                        sid = llm.add_request(prompt, max_new, ignore_eos=ignore_eos, arrival_time=t_arrival)
+                        kw = {"sampling": sampling} if sampling is not None else {}
+                        sid = llm.add_request(prompt, max_new, ignore_eos=ignore_eos, arrival_time=t_arrival, **kw)
                     except Exception as e:                      # rejected (too long, ...): tell the caller
                         out_conn.send(("error", [rid], _picklable(e)))
                         continue
@@ -189,16 +191,17 @@ class EngineProcess:
         with self._lock:
             self._req_w.send(msg)
 
-    async def generate(self, prompt_ids: list[int], max_new_tokens: int,
-                       ignore_eos: bool = False) -> AsyncIterator[tuple[int, float]]:
-        """Yield (token, timestamp) as the engine process produces them."""
+    async def generate(self, prompt_ids: list[int], max_new_tokens: int, ignore_eos: bool = False,
+                       sampling=None) -> AsyncIterator[tuple[int, float]]:
+        """Yield (token, timestamp) as the engine process produces them. sampling: SamplingParams or None."""
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
         with self._lock:
             rid = self._next_rid
             self._next_rid += 1
             self._streams[rid] = (loop, q)
-            self._req_w.send(("add", rid, list(prompt_ids), max_new_tokens, ignore_eos, time.perf_counter()))
+            self._req_w.send(("add", rid, list(prompt_ids), max_new_tokens, ignore_eos, time.perf_counter(),
+                              sampling))
         done = False
         try:
             while True:

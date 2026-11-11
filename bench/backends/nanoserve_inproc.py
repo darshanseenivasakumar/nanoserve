@@ -27,7 +27,7 @@ class NanoserveBackend:
                  kv_cache_tokens: int | None = None, block_size: int = 16, attn_backend: str | None = None,
                  draft_model: str | None = None, num_speculative_tokens: int = 4, cuda_graphs: bool | None = None,
                  piecewise_graphs: bool | None = None, fused_ops: bool | None = None,
-                 engine: LLMEngine | None = None):
+                 prefix_caching: bool = False, engine: LLMEngine | None = None):
         self.model_name = model_name
         self.spec = draft_model is not None
         if self.spec:
@@ -49,7 +49,7 @@ class NanoserveBackend:
                                                            kv_cache=kv_cache, kv_cache_tokens=kv_cache_tokens,
                                                            block_size=block_size, attn_backend=attn_backend,
                                                            cuda_graphs=cuda_graphs, piecewise_graphs=piecewise_graphs,
-                                                           fused_ops=fused_ops)
+                                                           fused_ops=fused_ops, prefix_caching=prefix_caching)
             if engine is None and self.llm.piecewise_runner is not None:
                 self.llm.piecewise_runner.capture_all()   # M9: ~40 token buckets; not lazily mid-benchmark
         self.engine = AsyncEngine(self.llm)
@@ -80,7 +80,8 @@ class NanoserveBackend:
         name = (f"nanoserve-{kv.kind}-{s.policy}" + ("-triton" if self.llm.attn_backend == "triton" else "")
                 + ("-graphs" if self.llm.graph_runner is not None else "")
                 + ("-pw" if self.llm.piecewise_runner is not None else "")
-                + ("-fused" if self.llm.model.fused else ""))
+                + ("-fused" if self.llm.model.fused else "")
+                + ("-apc" if getattr(kv, "prefix_caching", False) else ""))
         return {"backend": "nanoserve", "engine": name, "model": self.model_name,
                 "attn_backend": self.llm.attn_backend,
                 "device": str(m.device), "dtype": str(m.dtype).replace("torch.", ""),
