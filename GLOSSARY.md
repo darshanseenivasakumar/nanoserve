@@ -34,8 +34,11 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
 - **Request throughput (req/s)**: completed requests per second.
 - **TTFT (time to first token)**: time from sending a request to receiving its first token. How responsive it
   feels. Dominated by queueing + prefill.
-- **TPOT (time per output token)** / **ITL (inter-token latency)**: average gap between consecutive output
-  tokens of one request, after the first. How fast text "streams". Dominated by decode.
+- **TPOT (time per output token)**: average gap between consecutive output tokens of ONE request, after
+  the first (one number per request). How fast text "streams". Dominated by decode.
+- **ITL (inter-token latency)**: EVERY gap between consecutive tokens, pooled over all requests (M9; vLLM's
+  definition). Same mean as TPOT, but its p99 shows stalls that TPOT averages away (one 1 s pause among
+  100 ms gaps barely moves a request's TPOT). Until M9 this glossary treated the two as one thing.
 - **E2E latency (end-to-end)**: time from sending a request to receiving its last token.
 - **Percentile, p50 / p99**: sort all values; p50 (median) is the middle one, p99 is the value 99% of requests
   beat. p99 shows the unlucky "tail". With few samples p99 is basically the maximum, so always report n.
@@ -217,7 +220,23 @@ Plain-language definitions of every term used in nanoserve. Running analogy: an 
   (better throughput, worse TTFT for early requests); smaller = the reverse. vLLM's API-server default on
   GPUs below 70 GB is 2048.
 - **Piecewise CUDA graphs**: graphing everything in a step EXCEPT attention (whose shapes vary with prefills),
-  so mixed prefill+decode steps stay fast. vLLM does this; nanoserve doesn't (its mixed steps run eagerly).
+  so mixed prefill+decode steps stay fast. vLLM does this; nanoserve does too since M9.
+
+## Piecewise CUDA graphs (M9)
+- **Mixed step**: one engine step that contains both prefill chunks and one-token decodes.
+- **Token-wise vs sequence-wise work**: norms, projections, RoPE, the KV write and the MLP treat every token
+  independently, so their shapes depend only on the step's TOTAL token count. Attention mixes tokens of the
+  same request, so its shapes depend on each request's lengths. Only token-wise work can be graphed per
+  token count.
+- **Graph piece**: one captured graph covering the token-wise work between two attention calls (layer i's
+  o_proj + MLP, then layer i+1's norm + QKV + RoPE + KV write). 24 layers -> 25 pieces per bucket.
+- **Token bucket**: the padded token count a piece set was captured for (16, 32, ..., 2048). A 230-token
+  step replays the 240-token pieces with 10 padding rows.
+- **Static buffer handoff**: pieces pass the residual stream, Q/K/V and the attention output through
+  buffers allocated once, outside the graphs. Then nothing a graph allocates must outlive it, so every piece
+  of every bucket can share one memory pool.
+- **Capture at startup**: capturing ~1,000 pieces takes seconds, so the server does it before accepting
+  traffic (vLLM does too); otherwise the first request of each new size would pay for it.
 
 ## Tooling
 - **uv**: a fast Python package/project manager. `uv sync` installs exactly what `pyproject.toml`/`uv.lock` say.

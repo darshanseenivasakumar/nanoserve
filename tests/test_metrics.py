@@ -63,6 +63,16 @@ def test_summarize():
     assert set(s["tpot"]) >= {"p50", "p99", "mean", "n"}
 
 
+def test_itl_pools_every_gap_and_sees_a_stall_tpot_averages_away():
+    # M9: request 0 has one 1.0 s stall among 0.1 s gaps. Its TPOT (mean gap) hides it; ITL keeps it.
+    records = [rec(0, 0.0, [0.1, 0.2, 1.2, 1.3, 1.4], 5), rec(1, 0.0, [0.1, 0.2, 0.3], 3)]
+    s = summarize(records, wall_time=2.0)
+    assert s["itl"]["n"] == 4 + 2                   # every consecutive gap of every request
+    assert s["itl"]["max"] == approx(1.0)
+    assert s["itl"]["p50"] == approx(0.1)
+    assert s["tpot"]["max"] == approx(1.3 / 4)      # the same stall, averaged into 0.325 s
+
+
 def test_summarize_counts_errors_but_excludes_them_from_latency():
     records = [rec(0, 0.0, [0.2, 0.4], 2), rec(1, 0.0, [], 0, error="boom")]
     s = summarize(records, wall_time=1.0)

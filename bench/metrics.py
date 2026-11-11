@@ -52,5 +52,9 @@ def summarize(records: list[RequestRecord], wall_time: float) -> dict:
         "req_per_s": len(ok) / wall_time if wall_time > 0 else 0.0,
         "ttft": _dist([r.ttft for r in ok]),
         "tpot": _dist([r.tpot for r in ok if r.tpot is not None]),
+        # M9: ITL = every gap between consecutive streamed chunks, pooled over all requests (vLLM's
+        # definition). TPOT is one MEAN gap per request, so a single long stall gets averaged away; ITL p99
+        # shows it. (With multi-token chunks a gap covers several tokens; our servers send one per chunk.)
+        "itl": _dist([b - a for r in ok for a, b in zip(r.t_chunks, r.t_chunks[1:])]),
         "e2e": _dist([r.e2e for r in ok]),
     }

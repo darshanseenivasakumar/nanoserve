@@ -462,3 +462,130 @@ vLLM control: 121.3 / 801.1 / 2197.4 tok/s (c=1/8/32), TTFT p50/p99 c=32 314/494
 => TTFT p50 at c=32: 606 -> 354 ms (-42%); gap to vLLM 1.8x -> 1.13x. Throughput unchanged (66-78% of
 vLLM). c=8 TTFT slightly worse (155 -> 173 ms; an 8-prompt burst fits one step either way, so this is
 noise-level). TPOT p50 at c=32 +1.8 ms (more mixed eager steps). Plots: `python -m bench.plot --tag m8,m6`.
+
+## 2026-11-11 — M9 plan: piecewise CUDA graphs for mixed steps (user: "do the next phase")
+Problem (from M8): any step that contains a prefill chunk runs eagerly (~35 ms) while pure-decode steps
+replay one CUDA graph (~13 ms). Under load most steps are mixed, so decode tokens ride the slow path:
+TPOT grows with load, and smaller token budgets make TPOT p99 worse.
+
+Why mixed steps can't use the M7 graph: attention's work depends on each request's prompt/chunk length
+and cached length (Python loop over sequences, SDPA shapes change every step). Everything else in a layer
+(RMSNorm, Q/K/V/O projections, RoPE, KV write, MLP) is per-token: its shape depends only on the total
+token count T.
+
+Plan (vLLM's "piecewise" idea, written by hand):
+- Split the forward at attention: piece 0 = embed + RoPE tables + layer 0 up to its KV write; piece j =
+  layer j-1's o_proj + residual + MLP, then layer j up to its KV write; piece L = last o_proj + MLP +
+  final norm. L+1 = 25 graphs per token bucket; attention runs eagerly between them (24 calls).
+- Pieces talk through STATIC buffers (x, q, k, v, attention output, cos/sin) sized for the largest
+  bucket, so graph temporaries can share one memory pool across pieces and buckets.
+- Token buckets up to the step budget (2048); a step of T tokens replays the smallest bucket >= T.
+  Padding rows: token 0, position 0, KV written to the reserved garbage block, outputs ignored. Every
+  piece is row-wise, so padding rows can't affect real rows.
+- LM head stays eager, only on the rows we sample (keeping [T, vocab] logits in a graph would cost
+  ~600 MB at T=2048).
+- model.forward_batch gets refactored into the same three functions (_pre / _attend / _post) the
+  runner uses, so eager and piecewise do the exact same math.
+- Pure-decode steps keep the M7 full graph (attention inside, faster). Speculative engine unchanged.
+- Server and benchmark backend capture every bucket at startup (vLLM does too); tests capture lazily.
+Gates (tests first): at an exact bucket size piecewise logits BITWISE equal eager for a mixed batch
+(fresh prefill + chunk continuation + kernel decodes); padded batch matches up to the tie rule; padding
+only touches the garbage block; engine with piecewise vs without matches up to the tie rule (budget 64,
+so most steps are mixed) and leaks no blocks; existing 123 tests stay green.
+Measure: mixed-step time eager vs piecewise (probe, interleaved), then server A/B (piecewise off/on,
+same session) + vLLM control.
+
+M9 code: model.forward_batch split into _pre / _attend / _post (+ lm_head_rows); eager and piecewise call
+the same functions. PiecewiseGraphRunner (nanoserve/cuda_graphs.py): L+1 = 25 graphs per token bucket,
+static-buffer handoff, eager attention between pieces, LM head eager on sampled rows; shares the M7
+runner's garbage block. Engine: pure-decode -> M7 full graph; other steps with T <= 512 -> piecewise;
+bigger -> eager. Server captures every graph before serving; flags --no-piecewise-graphs (server,
+harness).
+Tests (6 new; 129 default + 7 spec passed): mixed batch (fresh 40-token prefill + 22-token chunk on 30
+cached + 2 kernel decodes = 64 = bucket) piecewise logits BITWISE equal eager (max|diff| = 0); padded into
+80: tie rule; padding writes only the garbage block; engine budget 64: 12/12 identical to M8 engine, 35/53
+steps piecewise, the rest full-graph, 0 eager; no leaked blocks.
+
+Probe (bench/runs/m9_step_probe.py; one synchronous mixed step, D decodes at ctx 200 + one P-token chunk;
+median of 3 interleaved x 15 reps):
+| D | P | T | eager ms | piecewise ms | speedup | graphs-only ms |
+|---|---|---|---|---|---|---|
+| 32 | 0 | 32 | 33.1 | 12.7 | 2.62x | 8.5 (M7 full graph: 12.3) |
+| 8 | 32 | 40 | 36.9 | 13.0 | 2.83x | 8.7 |
+| 8 | 128 | 136 | 37.5 | 22.1 | 1.69x | 18.3 |
+| 32 | 32 | 64 | 38.3 | 13.7 | 2.80x | 8.9 |
+| 32 | 128 | 160 | 37.7 | 23.1 | 1.63x | 18.8 |
+| 32 | 224 | 256 | 37.1 | 25.1 | 1.48x | 20.2 |
+| 32 | 480 | 512 | 49.3 | 46.5 | 1.06x | 40.4 |
+First run (buckets to 2048): 32+992 -> 86.0 vs 86.8 ms (0.99x), 32+2016 -> 173.4 vs 174.5 (0.99x).
+- Small mixed steps now cost what a pure-decode graph step costs (~13 ms, was ~37).
+- At T >= 512 the step is compute-bound: graphs hide nothing. DECISION: piecewise buckets stop at 512
+  (vLLM's default max capture size is also 512): every 16 tokens to 256, then every 32 -> 24 buckets,
+  600 graphs, captured in ~3.9 s. FLAG (rule 6): I changed my own new test's expected top bucket
+  2048 -> 512 to match this decision.
+- What's left at T ~ 150-250 is real compute: the 25 graph replays alone take 18-20 of the 22-25 ms;
+  eager attention between them adds ~4 ms.
+- FAILED first, then fixed: capture cost +768 MiB reserved (buckets to 2048, smallest first). Two causes:
+  (1) captured smallest-first, so each bigger bucket needed new pool segments -> now largest-first, as
+  vLLM does (its effect alone was NOT isolated: it changed together with the 2048 -> 512 cap, which gave
+  +528 MiB reserved / +203 allocated); (2) a NEW warm-up stream per capture, and PyTorch keeps a cuBLAS workspace per stream:
+  +203 MiB stayed allocated after capture. One shared stream -> +16 MiB allocated / +68 MiB reserved.
+  The M7 decode runner had the same per-stream leak since M7 (~8 MiB x 11 buckets); fixed too.
+
+M9 server A/B (bench/runs/m9_bench.sh; HTTP server, piecewise off = the M8 engine, then on; same session;
+both capture all graphs at startup, 3.0 s / 5.1 s):
+| fixed 128 | c=1 | c=4 | c=8 | c=16 | c=32 |
+|---|---|---|---|---|---|
+| tok/s off / on | 97.9 / 98.4 | 324.9 / 328.4 | 569.3 / 581.7 | 981.8 / 998.5 | 1497.0 / 1547.9 |
+| TTFT p50/p99 off | 34/63 | 91/163 | 166/240 | 238/359 | 323/559 |
+| TTFT p50/p99 on | **26**/63 | **59**/169 | 162/197 | 243/312 | 355/634 |
+| TPOT p50 off / on | 10.1 / 10.1 | 11.7 / 11.6 | 12.9 / 12.7 | 14.4 / 14.1 | 18.7 / 17.8 |
+| varied 16-256 | | c=4 | c=8 | c=16 | c=32 |
+| tok/s off / on | | 315.6 / 323.8 | 522.0 / 545.9 | 858.1 / 897.6 | 1147.0 / 1227.3 |
+| TTFT p50 off / on | | 52 / 37 | 59 / 41 | 70 / 49 | 109 / 111 |
+| TPOT p50 off / on | | 12.2 / 12.1 | 14.2 / 13.5 | 16.4 / 15.5 | 21.1 / 19.4 |
+| TPOT p99 off / on | | 13.4 / 13.0 | 15.7 / 15.1 | 19.2 / 18.7 | 24.0 / 31.5 |
+vLLM control: 124.6 / 823.0 / 2237.9 tok/s (c=1/8/32); TTFT p50/p99 27/57, 102/172, 344/550 ms; TPOT p50
+8.0 / 9.0 / 11.8 ms. => M9 = 79% / 71% / 69% of vLLM at c=1/8/32.
+- Clear wins: low-load TTFT (a lone ~200-token prompt is a pure prefill step < 512 tokens, now graphed:
+  c=1 34 -> 26 ms, c=4 91 -> 59 ms) and varied-length throughput (+2.6 / +4.6 / +4.6 / +7.0%).
+- Fixed c >= 8: piecewise barely applies. In-process stats: 9 of 783 steps at c=32 (bursts of 32 prompts
+  are chunked at 2048 tokens > 512 cap). So the c=32 TTFT change (323 -> 355 ms) is noise, not an effect.
+- FLAG: varied c=32 TPOT p99 got worse on the server (24.0 -> 31.5) but better in-process (27.3 -> 24.0,
+  below). p99 of 64 requests ~= the single worst request; I read both as noise.
+- Cross-check: in-process varied b2048 ran 22 piecewise steps per repeat x ~20 ms saved = 0.44 s; measured
+  wall-time saving 0.48 s.
+
+In-process c=32 budget sweep, two sessions (m9_bench.sh tail, then m9_itl_sweep.sh after adding ITL):
+| budget, mixed steps | fixed tok/s | fixed TTFT p50/p99 | var tok/s | var TPOT p50/p99 | var TTFT p50/p99 |
+|---|---|---|---|---|---|
+| 2048 eager (S1 / S2) | 1684.6 / – | 302/529 / – | 1286.2 / 1458.0 | 18.8/27.3 / 16.7/23.4 | 93/573 / 83/499 |
+| 2048 piecewise | 1704.6 / 1581.0 | 299/519 / 336/501 | 1386.4 / 1466.8 | 16.7/24.0 / 16.0/25.1 | 90/539 / 86/488 |
+| 1024 piecewise | 1665.5 / 1856.1 | 248/592 / 249/522 | 1380.6 / 1265.7 | 17.0/28.4 / 17.2/29.4 | 98/589 / 88/557 |
+| 512 eager | 1603.9 / – | 232/752 / – | 1256.9 / 1184.1 | 19.6/32.3 / 20.6/36.5 | 124/726 / 128/736 |
+| 512 piecewise | 1650.2 / 1814.0 | 194/651 / 192/596 | 1370.2 / 1469.7 | 17.2/28.9 / 16.5/27.2 | 96/680 / 94/603 |
+- FLAG, noise: the same config differs up to 8-15% in tok/s between sessions (machine in use). Only
+  directions that hold in BOTH sessions are claimed:
+  * piecewise vs eager at budget 512, varied: +9% / +24% tok/s, TPOT p99 -10% / -25%, TTFT p50 -23% / -27%;
+  * at budget 2048, varied: +8% / +0.6% tok/s (an effect too small to separate from this noise);
+  * smaller budget with piecewise: TTFT p50 at fixed c=32 drops (~317 -> ~249 -> ~193 ms; mean of the two sessions) but TTFT p99
+    rises (~510 -> ~557 -> ~624 ms).
+
+ITL (added to the harness in M9b: every token gap pooled; FLAG rule 6: harness change, metric added, no
+existing metric or check changed; 1 new test). Session 2, piecewise on, c=32:
+| budget | fixed TPOT p50/p99 | fixed ITL p50/p90/p99/max | var TPOT p50/p99 | var ITL p50/p90/p99/max |
+|---|---|---|---|---|
+| 2048 | 17.9/19.9 | 15.1/18.4/**154.4**/178 | 16.0/25.1 | 13.1/16.6/69.3/155 |
+| 1024 | 15.4/16.8 | 12.8/13.5/**83.0**/87 | 17.2/29.4 | 13.0/21.8/83.8/447 |
+| 512 | 15.9/17.0 | 12.9/13.9/**49.1**/51 | 16.5/27.2 | 13.2/24.4/48.2/51 |
+| 2048 eager / 512 eager (var) | | | 16.7/23.4 / 20.6/36.5 | 12.7/29.4/69.2/154 / 14.3/44.1/63.8/109 |
+=> M8's surprise explained. A smaller budget DOES bound the worst token gap, as vLLM says (fixed ITL p99
+154 -> 83 -> 49 ms; the gap = one prefill step: ~170 ms at 2048 tokens, ~47 ms at 512). It does NOT
+shrink a request's mean gap (TPOT): the same prefill compute is only sliced into more, shorter
+interruptions. vLLM's docs speak of ITL; M8 measured TPOT. The other half of M8's effect was eager mixed
+steps, which piecewise removes (512 varied: ITL p90 44 -> 24 ms, TPOT p99 36.5 -> 27.2).
+The 447 ms max ITL at 1024 varied is a single stall, not reproduced at 512 or 2048 (cause unknown; one
+event in ~26k gaps).
+- DECISION: keep the 2048 default. 512 trades better TTFT p50 and much smaller worst-case token gaps for
+  worse TTFT p99 and maybe 1-3% throughput (noise-level here). It is the better setting for interactive
+  chat; noted in the README instead of changing the default without a dedicated same-session A/B.
