@@ -174,14 +174,15 @@ class Qwen2Model:
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos().to(self.dtype), emb.sin().to(self.dtype)
 
-    def _attention(self, i: int, layer: LayerWeights, h: torch.Tensor, cos, sin,
-                   seqs: list[SeqInput], paged=None, slot_mapping=None, decode_meta=None) -> torch.Tensor:
-        """h: [1, N, hidden] = the flattened tokens of every sequence in this step.
+    # A layer is split in three so that M9's piecewise CUDA graphs can replay _post + _pre (token-wise work,
+    # shapes depend only on the total token count) and run only _attend (per-sequence work) eagerly.
+    # forward_batch calls the very same functions, so eager and graphed steps do identical math.
 
-        SELECTIVE BATCHING: the Q/K/V/O projections and RoPE are token-wise, so they run ONCE over all N
-        tokens. Attention mixes tokens *within* a sequence, against that sequence's own cache, so it runs
-        once PER SEQUENCE. (M4 replaces this Python loop with one kernel covering every sequence.)
-        """
+    def _pre(self, i: int, x: torch.Tensor, cos, sin, paged=None, slot_mapping=None):
+        """Token-wise first half of layer i: RMSNorm, Q/K/V projections, RoPE, KV write.
+        x: [1, N, hidden]. Returns q [1, N, n_heads, hd], k and v [1, N, n_kv_heads, hd]."""
+        layer = self.layers[i]
+        h = rms_norm(x, layer.ln1, self.cfg.rms_norm_eps)
         N = h.shape[1]
         hd = self.cfg.head_dim
         q = F.linear(h, layer.q_w, layer.q_b).view(1, N, -1, hd)   # [1, N, n_heads, hd]
@@ -193,13 +194,34 @@ class Qwen2Model:
         if paged is not None:
             # Paged (M3): store every token's K/V of this step with ONE indexed copy (slot mapping).
             paged.write(i, k[0], v[0], slot_mapping)
-        o_all = None
+        return q, k, v
+
+    def _post(self, i: int, x: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+        """Token-wise second half of layer i: output projection + residual, RMSNorm, SwiGLU MLP + residual."""
+        layer = self.layers[i]
+        x = x + F.linear(o, layer.o_w)
+        h = rms_norm(x, layer.ln2, self.cfg.rms_norm_eps)
+        return x + F.linear(F.silu(F.linear(h, layer.gate_w)) * F.linear(h, layer.up_w), layer.down_w)
+
+    def _attend(self, i: int, q, k, v, seqs: list[SeqInput], paged=None, decode_meta=None,
+                out: torch.Tensor | None = None) -> torch.Tensor:
+        """The per-sequence middle of layer i. q/k/v: [1, N, heads, hd] = the flattened tokens of every
+        sequence in this step. Returns the attention output [1, N, n_heads * hd] (written into `out` if given).
+
+        SELECTIVE BATCHING: the projections and RoPE (_pre/_post) are token-wise, so they run ONCE over all N
+        tokens. Attention mixes tokens *within* a sequence, against that sequence's own cache, so it runs
+        once PER SEQUENCE -- except one-token decodes, which M4's kernel handles all together.
+        """
+        N = q.shape[1]
+        hd = self.cfg.head_dim
+        o_all = out
         if decode_meta is not None:
             # M4: every one-token decode request of this step in ONE Triton launch, reading K/V in place.
             from nanoserve.kernels.paged_attention import paged_attention_decode
             o_dec = paged_attention_decode(q[0][decode_meta.token_idx], paged.k[i], paged.v[i],
                                            decode_meta.block_tables, decode_meta.context_lens, hd ** -0.5)
-            o_all = torch.empty(1, N, q.shape[2] * hd, device=q.device, dtype=q.dtype)
+            if o_all is None:
+                o_all = torch.empty(1, N, q.shape[2] * hd, device=q.device, dtype=q.dtype)
             o_all[0].index_copy_(0, decode_meta.token_idx, o_dec.reshape(o_dec.shape[0], -1))
         outs, start = [], 0
         for seq in seqs:
@@ -241,10 +263,8 @@ class Qwen2Model:
         if o_all is not None:                     # kernel rows already placed; drop in the SDPA rows
             for s0, o in outs:
                 o_all[:, s0:s0 + o.shape[1]] = o
-            o = o_all
-        else:
-            o = outs[0][1] if len(outs) == 1 else torch.cat([t for _, t in outs], dim=1)
-        return F.linear(o, layer.o_w)
+            return o_all
+        return outs[0][1] if len(outs) == 1 else torch.cat([t for _, t in outs], dim=1)
 
     @torch.inference_mode()
     def forward_batch(self, token_ids: torch.Tensor, positions: torch.Tensor, seqs: list[SeqInput],
@@ -264,16 +284,17 @@ class Qwen2Model:
         assert sum(s.n_tokens for s in seqs) == token_ids.shape[0], "seqs must cover token_ids exactly"
         x = F.embedding(token_ids, self.embed)[None]          # [1, N, hidden]
         cos, sin = self.rope(positions)
-        eps = self.cfg.rms_norm_eps
-        for i, layer in enumerate(self.layers):
-            x = x + self._attention(i, layer, rms_norm(x, layer.ln1, eps), cos, sin, seqs, paged, slot_mapping,
-                                    decode_meta)
-            h = rms_norm(x, layer.ln2, eps)
-            x = x + F.linear(F.silu(F.linear(h, layer.gate_w)) * F.linear(h, layer.up_w), layer.down_w)
+        for i in range(self.cfg.n_layers):
+            q, k, v = self._pre(i, x, cos, sin, paged, slot_mapping)
+            x = self._post(i, x, self._attend(i, q, k, v, seqs, paged, decode_meta))
         for seq in seqs:
             if seq.cache is not None:
                 seq.cache.advance(seq.n_tokens)
-        x = rms_norm(x, self.norm, eps)
+        x = rms_norm(x, self.norm, self.cfg.rms_norm_eps)
+        return self.lm_head_rows(x, seqs, logits)
+
+    def lm_head_rows(self, x: torch.Tensor, seqs: list[SeqInput], logits="last") -> torch.Tensor:
+        """Final-normed hidden states [1, N, hidden] -> logits for the requested rows (see forward_batch)."""
         if isinstance(logits, torch.Tensor):
             x = x[:, logits, :]
         elif logits == "last":

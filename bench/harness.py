@@ -107,7 +107,7 @@ def make_backend(args) -> Backend:
                                 policy=args.nanoserve_policy, max_num_batched_tokens=args.max_num_batched_tokens,
                                 kv_cache=args.kv_cache, block_size=args.block_size, attn_backend=args.attn_backend,
                                 draft_model=args.draft_model, num_speculative_tokens=args.num_speculative_tokens,
-                                cuda_graphs=args.cuda_graphs,
+                                cuda_graphs=args.cuda_graphs, piecewise_graphs=args.piecewise_graphs,
                                 kv_cache_tokens=(int(args.kv_cache_gb * 2**30) // _kv_bytes_per_token(args)
                                                  if args.kv_cache_gb else None))
     from bench.backends.openai_http import OpenAIBackend
@@ -210,6 +210,8 @@ def parse_args(argv=None):
     p.add_argument("--cuda-graphs", dest="cuda_graphs", action="store_true", default=None,
                    help="nanoserve: force CUDA-graph decode on (default: on with paged + triton)")
     p.add_argument("--no-cuda-graphs", dest="cuda_graphs", action="store_false")
+    p.add_argument("--no-piecewise-graphs", dest="piecewise_graphs", action="store_false", default=None,
+                   help="nanoserve: run mixed prefill+decode steps eagerly (M9 default: piecewise graphs)")
     p.add_argument("--attn-backend", choices=["triton", "sdpa"], default=None,
                    help="nanoserve attention (default: triton kernel on GPU for the paged cache)")
     p.add_argument("--max-num-batched-tokens", type=int, default=2048, help="nanoserve: per-step token budget (M8 default)")

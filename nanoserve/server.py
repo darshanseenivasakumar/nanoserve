@@ -183,7 +183,9 @@ def main(argv=None) -> None:
     p.add_argument("--max-num-batched-tokens", type=int, default=2048, help="per-step token budget (vLLM default on <70 GB GPUs)")
     p.add_argument("--kv-cache-gb", type=float, default=2.0, help="explicit KV budget (GiB)")
     p.add_argument("--attn-backend", choices=["triton", "sdpa"], default=None)
-    p.add_argument("--no-cuda-graphs", action="store_true", help="disable CUDA-graph decode steps")
+    p.add_argument("--no-cuda-graphs", action="store_true", help="disable all CUDA graphs")
+    p.add_argument("--no-piecewise-graphs", action="store_true",
+                   help="run mixed prefill+decode steps eagerly (M9 default: piecewise CUDA graphs)")
     p.add_argument("--draft-model", default=None, help="enable speculative decoding with this draft model")
     p.add_argument("--num-speculative-tokens", type=int, default=4)
     args = p.parse_args(argv)
@@ -202,7 +204,10 @@ def main(argv=None) -> None:
         llm = LLMEngine(target, eos, max_seq_len=args.max_seq_len, max_num_seqs=args.max_num_seqs,
                         max_num_batched_tokens=args.max_num_batched_tokens, kv_cache="paged",
                         kv_cache_tokens=kv_tokens, attn_backend=args.attn_backend,
-                        cuda_graphs=False if args.no_cuda_graphs else None)
+                        cuda_graphs=False if args.no_cuda_graphs else None,
+                        piecewise_graphs=False if (args.no_cuda_graphs or args.no_piecewise_graphs) else None)
+        # Capture every graph before accepting traffic (vLLM does the same), so no request pays for one.
+        print(f"captured CUDA graphs in {llm.capture_graphs():.1f} s", flush=True)
     app = create_app(AsyncEngine(llm), tokenizer, args.model)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

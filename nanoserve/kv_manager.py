@@ -133,15 +133,21 @@ class PagedKVManager:
         bt = None if use_kernel or ctx == 0 else torch.tensor(table.blocks, device=self.device)
         return SeqInput(n_tokens, block_table=bt, ctx_len=ctx, use_kernel=use_kernel)
 
+    def decode_meta(self) -> DecodeMeta | None:
+        """Kernel inputs for this step's one-token decodes (None if there are none)."""
+        if not self._dec_idx:
+            return None
+        width = max(len(t) for t in self._dec_tables)
+        tables = [t + [0] * (width - len(t)) for t in self._dec_tables]
+        return DecodeMeta(token_idx=torch.tensor(self._dec_idx, device=self.device),
+                          block_tables=torch.tensor(tables, dtype=torch.int32, device=self.device),
+                          context_lens=torch.tensor(self._dec_lens, dtype=torch.int32, device=self.device))
+
     def forward_kwargs(self) -> dict:
         kw = {"paged": self.pool, "slot_mapping": torch.tensor(self._slots, device=self.device)}
-        if self._dec_idx:
-            width = max(len(t) for t in self._dec_tables)
-            tables = [t + [0] * (width - len(t)) for t in self._dec_tables]
-            kw["decode_meta"] = DecodeMeta(
-                token_idx=torch.tensor(self._dec_idx, device=self.device),
-                block_tables=torch.tensor(tables, dtype=torch.int32, device=self.device),
-                context_lens=torch.tensor(self._dec_lens, dtype=torch.int32, device=self.device))
+        meta = self.decode_meta()
+        if meta is not None:
+            kw["decode_meta"] = meta
         return kw
 
     def graph_inputs(self) -> tuple[list[int], list[list[int]], list[int]]:

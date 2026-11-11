@@ -60,7 +60,7 @@ class LLMEngine:
                  policy: str = "continuous", max_num_seqs: int = 8, max_num_batched_tokens: int = 2048,
                  batch_wait_s: float = 0.02, kv_cache: str = "paged", kv_cache_tokens: int | None = None,
                  block_size: int = 16, attn_backend: str | None = None, cuda_graphs: bool | None = None,
-                 chunked_prefill: bool | None = None):
+                 chunked_prefill: bool | None = None, piecewise_graphs: bool | None = None):
         """kv_cache: "paged" (M3, default) or "contiguous" (M1/M2). kv_cache_tokens: the explicit KV budget
         in tokens (default 32 x max_seq_len)."""
         self.model = model
@@ -94,10 +94,22 @@ class LLMEngine:
         if cuda_graphs:
             from nanoserve.cuda_graphs import DecodeGraphRunner
             self.graph_runner = DecodeGraphRunner(model, self.kv.pool, max_seq_len)
+        # M9: piecewise graphs for steps containing prefill chunks (on wherever decode graphs are).
+        if piecewise_graphs is None:
+            piecewise_graphs = bool(cuda_graphs)
+        self.piecewise_runner = None
+        if piecewise_graphs:
+            if kv_cache != "paged" or model.device.type != "cuda":
+                raise ValueError("piecewise CUDA graphs need the paged KV cache on a GPU")
+            from nanoserve.cuda_graphs import PiecewiseGraphRunner
+            garbage = (self.graph_runner.garbage_block if self.graph_runner is not None
+                       else self.kv.pool.allocator.allocate())
+            self.piecewise_runner = PiecewiseGraphRunner(model, self.kv.pool, garbage,
+                                                         max_tokens=max_num_batched_tokens)
         self.sequences: dict[int, Sequence] = {}   # unfinished only
         self.last_step: StepStats | None = None
         self._next_id = 0
-        self._stats = {"steps": 0, "graph_steps": 0, "prefill_chunks": 0, "peak_running": 0,
+        self._stats = {"steps": 0, "graph_steps": 0, "piecewise_steps": 0, "prefill_chunks": 0, "peak_running": 0,
                        "kv_used_tokens_peak": 0,
                        "kv_reserved_tokens_peak": 0, "kv_util_sum": 0.0, "kv_util_samples": 0}
 
@@ -116,7 +128,20 @@ class LLMEngine:
         s["attn_backend"] = self.attn_backend
         s["cuda_graphs"] = self.graph_runner is not None
         s["graph_buckets"] = self.graph_runner.captured_buckets if self.graph_runner else []
+        s["piecewise_graphs"] = self.piecewise_runner is not None
+        s["piecewise_buckets"] = self.piecewise_runner.captured_buckets if self.piecewise_runner else []
         return s
+
+    def capture_graphs(self) -> float:
+        """Capture every CUDA graph this engine can use NOW (server / benchmark startup), so no request pays
+        for a capture mid-run. Returns seconds taken."""
+        t0 = time.perf_counter()
+        if self.graph_runner is not None:
+            self.graph_runner.capture_all(self.scheduler.max_num_seqs)
+        if self.piecewise_runner is not None:
+            self.piecewise_runner.capture_all()
+        torch.cuda.synchronize()
+        return time.perf_counter() - t0
 
     @classmethod
     def from_pretrained(cls, name: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16,
@@ -171,6 +196,11 @@ class LLMEngine:
             slots, tables, lens = self.kv.graph_inputs()
             logits = runner.run(tokens, positions, slots, tables, lens)
             self._stats["graph_steps"] += 1
+        elif self.piecewise_runner is not None and len(tokens) <= self.piecewise_runner.max_tokens:
+            # M9: mixed step -> token-wise pieces from graphs, attention eagerly in between.
+            logits = self.piecewise_runner.run(tokens, positions, self.kv.graph_inputs()[0], inputs,
+                                               self.kv.decode_meta())
+            self._stats["piecewise_steps"] += 1
         else:
             logits = m.forward_batch(torch.tensor(tokens, device=m.device), torch.tensor(positions, device=m.device),
                                      inputs, logits="last", **self.kv.forward_kwargs())
