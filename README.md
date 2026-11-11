@@ -85,6 +85,7 @@ vLLM's 8–12 ms. The biggest remaining gap is **time to first token under load*
 | M5 | Speculative decoding (0.5B draft -> 1.5B target) | output **identical** to plain greedy; acceptance 53-67%; but **0.71-0.82x slower** here (draft costs 0.86x the target: both launch-bound) |
 | M6 | OpenAI-compatible streaming server + full benchmark | 23–30% of vLLM; gap = a constant ~4x per-step cost (launch overhead) |
 | M7 | CUDA-graph decode steps (one graph per batch bucket, static buffers, padding into a garbage block) | graph step **bitwise** = eager step; decode step **34 → 10 ms**; **65–78% of vLLM** |
+| M7b | Graphs for speculative decoding: draft steps + verification as "one decode row per token" | speculative now **1.21x faster** at c=1 (k=2), was 0.71x; cost model predicted within ~4% |
 
 Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every term: [`GLOSSARY.md`](GLOSSARY.md).
 
@@ -100,7 +101,7 @@ Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every t
   gap <= 0.25, about one bf16 rounding step at these magnitudes); anything else fails.
 - **Kernel**: Triton output vs a PyTorch oracle: fp32 <= 1e-5, bf16 <= 1e-2 (measured <= 4.5e-3), for
   the head layouts of 0.5B, 1.5B and 3B.
-- 122 tests (`uv run pytest`: 117, plus `uv run pytest -m spec`: 5 speculative tests on the 1.5B model).
+- 124 tests (`uv run pytest`: 117, plus `uv run pytest -m spec`: 7 speculative tests on the 1.5B model).
 
 ## Where we lose, and why (honest section)
 
@@ -118,16 +119,19 @@ Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every t
 3. **Time to first token under load — now the largest gap.** Prefills are not graphed and run one request at
    a time through SDPA, and there is no chunked prefill: TTFT p50 at c=32 is 606 ms vs vLLM's 335 ms, and a
    long prompt joining the batch stalls everyone's next token for that step.
-4. **Speculative decoding lost (0.71x at k=4, measured before M7).** It is lossless (output identical to the
-   target) and verifying 5 tokens costs only 1.3x one token — but the 0.5B draft cost 0.86x the 1.5B target
-   per forward because both were launch-bound. The speculative engine does not use graphs yet; with a ~6 ms
-   graphed draft the same acceptance predicts ~1.6x at c=1. Not re-measured.
+4. **Speculative decoding: a modest, low-load win — and only after graphs.** It is lossless (output identical
+   to the target). Without graphs it LOST (0.71x at k=4): the 0.5B draft cost 0.86x the 1.5B target because
+   both were launch-bound. With graphs (draft 9.5 ms vs target 24.7 ms; verifying 5 tokens costs 1.07x one)
+   it wins **1.21x at k=2, c=1** (TPOT 24.6 → 20.1 ms), 1.12x at k=4; at c=4 it is break-even (1.07x / 0.96x)
+   because batching already shares the target's cost. A cost model predicted each number within ~4%
+   (`bench/runs/m7b_costs.py`). Acceptance is only 53–67% for this draft/target pair, which caps the gain.
 5. **llama.cpp depends on its configuration.** Its 8-slot config was 2.3x faster than nanoserve M6 at c=8;
    nanoserve M7 now beats it there (554 vs 486 tok/s; varied 504 vs 392). Its per-token cost drops when the
    slot count matches the load; ours needs no tuning.
 6. **Not implemented:** graphs for prefill, op fusion (torch.compile), chunked prefill, prefix caching,
    swap-to-CPU preemption, sampling (greedy only), quantization, tensor parallelism, split-K decode for long
-   contexts. Speculative engine: reserves KV for prompt + max_new up front (no preemption), SDPA only, no graphs.
+   contexts. Speculative engine: reserves KV for prompt + max_new up front (no preemption), fixed k (no
+   adaptive lookahead), eager prefills.
 7. **CUDA-graph caveats.** One graph per bucket (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128), captured lazily on
    first use (a one-off pause of ~1 s); batches between buckets are padded (5 requests run the 8-graph);
    batches above 128 or any step containing a prefill run eagerly.
@@ -145,13 +149,15 @@ Full numbers, every failure and every judgment call: [`LOG.md`](LOG.md). Every t
 - Decode attention per layer at 8 requests: **36.7 ms → 2.6 ms per step** (gather+SDPA loop → one Triton launch).
 - Continuous vs static batching on varied lengths: **TTFT 3.4 s → 114 ms** at c=8.
 - CUDA graphs: decode step **33.9 → 9.8 ms** at batch 1 (≈1,000 launches → 1 replay); nanoserve 23–30% → 65–78% of vLLM.
+- Speculative decoding pays only if k × draft + verify < tokens accepted × target step: with graphs
+  2 × 9.5 + 26.1 = 45 ms buys 2.28 tokens vs 24.7 ms for one → **1.21x** measured (1.25x predicted).
 
 ## Reproduce
 
 ```bash
 uv sync
 uv run pytest                      # 117 tests (GPU + model download)
-uv run pytest -m spec              # 5 speculative-decoding tests (1.5B model, ~8 GB RAM)
+uv run pytest -m spec              # 7 speculative-decoding tests (1.5B model, ~8 GB RAM)
 
 # in-process engine
 uv run python -m bench.harness --backend nanoserve --concurrency 1,4,8,16,32 --kv-cache-gb 2

@@ -68,7 +68,8 @@ class NanoserveBackend:
             return {"backend": "nanoserve", "engine": f"nanoserve-spec-k{e.k}", "model": self.model_name,
                     "draft_model": self.draft_model, "num_speculative_tokens": e.k,
                     "dtype": str(e.target.dtype).replace("torch.", ""), "kv_cache": "paged (reserved per request)",
-                    "target_kv_tokens": e.tpool.num_blocks * e.block_size, "attn_backend": "sdpa",
+                    "target_kv_tokens": e.tpool.num_blocks * e.block_size,
+                    "attn_backend": "triton (graphed decode rows)" if e.t_graph else "sdpa", "cuda_graphs": e.t_graph is not None,
                     "max_seq_len": e.max_seq_len, "torch": torch.__version__}
         m, s = self.llm.model, self.llm.scheduler
         kv = self.llm.kv

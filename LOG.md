@@ -366,3 +366,36 @@ fusion. Speculative engine does not use graphs (not re-measured).
 Plots: `python -m bench.plot --tag m7,m6` (plot.py now merges tags; nanoserve M6 shown as "nanoserve [m6]").
 Process note: /tmp in WSL was cleared by a WSL restart mid-session; patch scripts now live in the session
 scratchpad.
+
+## 2026-11-11 — M7b: speculative decoding with CUDA graphs (user: "Yes, graph the draft")
+Note first: the M5 "~1.6x" prediction assumed plain decoding stays eager (36.5 ms). Plain decoding is now
+graphed too, so speculative decoding must beat a ~3x faster baseline. Both models' decode-like steps are
+graphed; verification uses the "one row per token" trick (shared block table, context lengths ctx+1..ctx+n)
+so the paged kernel enforces causality and the step is graph-safe.
+Correctness (pytest -m spec, 7 passed): fp32 GPU graphed self-speculation identical to plain greedy
+(acceptance 1.000; 40 draft + 10 verify graph steps); bf16 0.5B->1.5B with graphs: acceptance 0.569,
+3/4 identical + 1 exact tie (gap 0.000). Default suite 117 passed.
+
+Graphed costs (bench/runs/m7b_costs.py, batch 1, ctx ~300, incl. input copies + argmax + tolist):
+  target 1.5B 1 row 24.68 ms | draft 0.5B 1 row 9.49 ms (ratio 0.38, was 0.86) | target 3 rows 26.08 ms |
+  target 5 rows 26.38 ms (verifying 5 tokens costs 1.07x one token).
+PREDICTION written before the benchmark (tokens/step from M5: k=2 2.28, k=4 3.05):
+  c=1: k=2 -> 19.8 ms/token vs 24.7 -> 1.25x; k=4 -> 21.1 ms/token -> 1.17x.
+  c=4: roughly break-even (~1.0-1.1x): batching already shares the target's cost.
+
+Measured (bench/runs/m7b_bench.sh; M5 settings: 1.5B target, 32 prompts x 128 tokens, 2 repeats, 0.25 GiB):
+| 1.5B, graphs on | c=1 tok/s | c=1 TPOT p50 | c=4 tok/s | c=4 TPOT p50 | acceptance |
+|---|---|---|---|---|---|
+| plain greedy | 39.8 | 24.6 ms | 140.6 | 27.1 ms | - |
+| speculative k=2 | **48.0 (1.21x; predicted 1.25x)** | 20.1 ms (pred 19.8) | 150.1 (1.07x) | 23.5 ms | 0.67 |
+| speculative k=4 | 44.4 (1.12x; predicted 1.17x) | 21.9 ms (pred 21.1) | 134.8 (0.96x) | 26.3 ms | 0.52-0.53 |
+vs M5 without graphs (same settings): plain 23.2 -> 39.8; spec k=2 19.1 -> 48.0 (2.5x); k=4 16.5 -> 44.4.
+Graph usage: e.g. k=2 c=1: 6,984 graphed draft steps + 3,492 graphed verifications in 3,556 steps
+(the rest were eager prefills).
+- The cost model predicted every measured number within ~4%. Speculative decoding now helps LATENCY at
+  low load (k=2 best: TPOT 24.6 -> 20.1 ms at c=1) and is break-even-to-negative under load, as the
+  literature says. k=2 beats k=4: each extra draft token costs 9.5 ms but is accepted less often
+  (acceptance 0.67 -> 0.53).
+- Flag: the result files' backend info for these spec runs says "attn_backend": "sdpa" -- a stale label in
+  the harness backend (fixed after the run); engine_stats in the same files show cuda_graphs true and the
+  graph step counts above.
