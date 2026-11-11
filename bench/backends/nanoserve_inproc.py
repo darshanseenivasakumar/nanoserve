@@ -25,7 +25,8 @@ class NanoserveBackend:
     def __init__(self, model_name: str, device: str = "cuda", dtype: str = "bfloat16", max_seq_len: int = 2048,
                  policy: str = "continuous", max_num_batched_tokens: int = 8192, kv_cache: str = "paged",
                  kv_cache_tokens: int | None = None, block_size: int = 16, attn_backend: str | None = None,
-                 draft_model: str | None = None, num_speculative_tokens: int = 4, engine: LLMEngine | None = None):
+                 draft_model: str | None = None, num_speculative_tokens: int = 4, cuda_graphs: bool | None = None,
+                 engine: LLMEngine | None = None):
         self.model_name = model_name
         self.spec = draft_model is not None
         if self.spec:
@@ -45,7 +46,8 @@ class NanoserveBackend:
                                                            max_seq_len=max_seq_len, policy=policy,
                                                            max_num_batched_tokens=max_num_batched_tokens,
                                                            kv_cache=kv_cache, kv_cache_tokens=kv_cache_tokens,
-                                                           block_size=block_size, attn_backend=attn_backend)
+                                                           block_size=block_size, attn_backend=attn_backend,
+                                                           cuda_graphs=cuda_graphs)
         self.engine = AsyncEngine(self.llm)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -70,7 +72,8 @@ class NanoserveBackend:
                     "max_seq_len": e.max_seq_len, "torch": torch.__version__}
         m, s = self.llm.model, self.llm.scheduler
         kv = self.llm.kv
-        name = f"nanoserve-{kv.kind}-{s.policy}" + ("-triton" if self.llm.attn_backend == "triton" else "")
+        name = (f"nanoserve-{kv.kind}-{s.policy}" + ("-triton" if self.llm.attn_backend == "triton" else "")
+                + ("-graphs" if self.llm.graph_runner is not None else ""))
         return {"backend": "nanoserve", "engine": name, "model": self.model_name,
                 "attn_backend": self.llm.attn_backend,
                 "device": str(m.device), "dtype": str(m.dtype).replace("torch.", ""),

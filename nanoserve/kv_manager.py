@@ -144,6 +144,10 @@ class PagedKVManager:
                 context_lens=torch.tensor(self._dec_lens, dtype=torch.int32, device=self.device))
         return kw
 
+    def graph_inputs(self) -> tuple[list[int], list[list[int]], list[int]]:
+        """(slots, block tables, context lens) of this step's kernel decodes, for the CUDA-graph path."""
+        return self._slots, self._dec_tables, self._dec_lens
+
     def commit(self, seq, n_tokens: int) -> None:
         seq.block_table.commit(n_tokens)
 

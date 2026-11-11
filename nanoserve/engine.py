@@ -59,7 +59,7 @@ class LLMEngine:
     def __init__(self, model: Qwen2Model, eos_token_ids: list[int], max_seq_len: int = 2048,
                  policy: str = "continuous", max_num_seqs: int = 8, max_num_batched_tokens: int = 8192,
                  batch_wait_s: float = 0.02, kv_cache: str = "paged", kv_cache_tokens: int | None = None,
-                 block_size: int = 16, attn_backend: str | None = None):
+                 block_size: int = 16, attn_backend: str | None = None, cuda_graphs: bool | None = None):
         """kv_cache: "paged" (M3, default) or "contiguous" (M1/M2). kv_cache_tokens: the explicit KV budget
         in tokens (default 32 x max_seq_len)."""
         self.model = model
@@ -81,11 +81,18 @@ class LLMEngine:
             raise ValueError(f"unknown kv_cache {kv_cache!r}")
         self.scheduler = Scheduler(policy, max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens,
                                    batch_wait_s=batch_wait_s, kv=self.kv)
+        # M7: CUDA graphs for pure-decode steps (needs the paged cache + Triton kernel; on by default there).
+        if cuda_graphs is None:
+            cuda_graphs = kv_cache == "paged" and attn_backend == "triton"
+        self.graph_runner = None
+        if cuda_graphs:
+            from nanoserve.cuda_graphs import DecodeGraphRunner
+            self.graph_runner = DecodeGraphRunner(model, self.kv.pool, max_seq_len)
         self.sequences: dict[int, Sequence] = {}   # unfinished only
         self.last_step: StepStats | None = None
         self._next_id = 0
-        self._stats = {"steps": 0, "peak_running": 0, "kv_used_tokens_peak": 0, "kv_reserved_tokens_peak": 0,
-                      "kv_util_sum": 0.0, "kv_util_samples": 0}
+        self._stats = {"steps": 0, "graph_steps": 0, "peak_running": 0, "kv_used_tokens_peak": 0,
+                       "kv_reserved_tokens_peak": 0, "kv_util_sum": 0.0, "kv_util_samples": 0}
 
     def reset_stats(self) -> None:
         for k in self._stats:
@@ -100,6 +107,8 @@ class LLMEngine:
         s["kv_util_mean"] = s["kv_util_sum"] / s["kv_util_samples"] if s["kv_util_samples"] else None
         s["kv_cache"] = self.kv.kind
         s["attn_backend"] = self.attn_backend
+        s["cuda_graphs"] = self.graph_runner is not None
+        s["graph_buckets"] = self.graph_runner.captured_buckets if self.graph_runner else []
         return s
 
     @classmethod
@@ -148,8 +157,16 @@ class LLMEngine:
         self.last_step = StepStats(n_prefill=n_prefill, n_decode=len(plan.scheduled) - n_prefill,
                                    n_tokens=len(tokens))
 
-        logits = m.forward_batch(torch.tensor(tokens, device=m.device), torch.tensor(positions, device=m.device),
-                                 inputs, logits="last", **self.kv.forward_kwargs())
+        runner = self.graph_runner
+        if (runner is not None and n_prefill == 0 and len(inputs) <= runner.max_bucket
+                and all(i.use_kernel for i in inputs)):
+            # M7: pure-decode step -> replay the captured CUDA graph (one launch instead of ~1,000).
+            slots, tables, lens = self.kv.graph_inputs()
+            logits = runner.run(tokens, positions, slots, tables, lens)
+            self._stats["graph_steps"] += 1
+        else:
+            logits = m.forward_batch(torch.tensor(tokens, device=m.device), torch.tensor(positions, device=m.device),
+                                     inputs, logits="last", **self.kv.forward_kwargs())
         next_tokens = logits.argmax(-1).tolist()      # greedy; one sync for the whole batch
 
         for seq, n in zip(plan.scheduled, counts):
